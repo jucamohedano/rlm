@@ -43,6 +43,21 @@ _RUNNER = textwrap.dedent(
     def _load(path, name):
         spec = importlib.util.spec_from_file_location(name, path)
         mod = importlib.util.module_from_spec(spec)
+        # Friendly execution namespace: submissions may use torch/np without
+        # repeating imports. User imports still work normally.
+        mod.__dict__.setdefault("torch", torch)
+        try:
+            import numpy as np
+            mod.__dict__.setdefault("np", np)
+        except Exception:
+            pass
+        try:
+            import triton
+            import triton.language as tl
+            mod.__dict__.setdefault("triton", triton)
+            mod.__dict__.setdefault("tl", tl)
+        except Exception:
+            pass
         spec.loader.exec_module(mod)
         return mod
 
@@ -50,6 +65,7 @@ _RUNNER = textwrap.dedent(
     N_TRIALS = int(sys.argv[3])
     ATOL = float(sys.argv[4])
     RTOL = float(sys.argv[5])
+    sub_source = open(SUB_PATH, encoding="utf-8").read()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     result = {
@@ -71,6 +87,13 @@ _RUNNER = textwrap.dedent(
         get_init_inputs = getattr(ref_mod, "get_init_inputs", lambda: [])
         sub_mod = _load(SUB_PATH, "submission")
         triton_forward = sub_mod.triton_forward
+        if "@triton.jit" not in sub_source:
+            result["error"] = (
+                "submission is not a Triton kernel (missing @triton.jit): "
+                "do not just call the PyTorch reference"
+            )
+            print(json.dumps(result))
+            raise SystemExit(0)
     except Exception as e:
         result["error"] = f"{type(e).__name__}: {e}"
         print(json.dumps(result))
