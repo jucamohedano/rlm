@@ -67,6 +67,8 @@ class TurnClass:
     exc_type: str = ""
     message: str = ""
     speedup: float | None = None
+    # (exc_type, message) of the exceptions chained behind `exc_type`, outermost first
+    chain: tuple[tuple[str, str], ...] = ()
 
     def short(self) -> str:
         if self.kind == "error":
@@ -130,7 +132,8 @@ def classify_ours(exec_exception: str | None, verify: dict[str, Any] | None) -> 
         if error.startswith("verifier crashed"):
             return TurnClass("error", "VerifierCrash", error)
         exc_type, message = _split_exception(error)
-        return TurnClass("error", exc_type, message)
+        chain = tuple(_split_exception(str(c)) for c in verify.get("error_chain") or [])
+        return TurnClass("error", exc_type, message, chain=chain)
     return TurnClass("incorrect", message=error)
 
 
@@ -142,7 +145,11 @@ def _norm_head(message: str) -> str:
 
 
 def error_head_ratio(a: TurnClass, b: TurnClass) -> float:
-    return difflib.SequenceMatcher(None, _norm_head(a.message), _norm_head(b.message)).ratio()
+    return _head_ratio(a.message, b.message)
+
+
+def _head_ratio(a: str, b: str) -> float:
+    return difflib.SequenceMatcher(None, _norm_head(a), _norm_head(b)).ratio()
 
 
 # Python's own arity error on the entry-point call, i.e. the harness could not fill the
@@ -159,7 +166,12 @@ def compatible(recorded: TurnClass, ours: TurnClass, min_head_ratio: float) -> b
         return True
     if ours.exc_type == "WrapperContractError":
         return recorded.exc_type == "TypeError" and bool(_ARITY_TYPE_ERROR.match(recorded.message))
-    return recorded.exc_type == ours.exc_type and error_head_ratio(recorded, ours) >= min_head_ratio
+    # Their harness reported the innermost exception of a chain (e.g. the TypeError that
+    # Triton re-raises as CompilationError), so ours may match at any depth of the chain.
+    return any(
+        recorded.exc_type == exc_type and _head_ratio(recorded.message, message) >= min_head_ratio
+        for exc_type, message in ((ours.exc_type, ours.message), *ours.chain)
+    )
 
 
 def extract_code(full_completion: str | None) -> str | None:

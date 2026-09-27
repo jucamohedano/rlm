@@ -85,6 +85,7 @@ _RUNNER = textwrap.dedent(
         "ref_ms": None,
         "kernel_ms": None,
         "error": "",
+        "error_chain": [],
         "trials": N_TRIALS,
         "device": device,
         "binding": None,
@@ -92,6 +93,18 @@ _RUNNER = textwrap.dedent(
 
     class AmbiguousReference(Exception):
         pass
+
+    def _record_error(e):
+        # Triton wraps the offending Python exception in CompilationError (`raise ... from e`);
+        # keep the whole chain so the failure can be matched by its underlying class too.
+        result["error"] = f"{type(e).__name__}: {e}"
+        chain, seen = [], set()
+        cur = e.__cause__ or e.__context__
+        while cur is not None and id(cur) not in seen:
+            seen.add(id(cur))
+            chain.append(f"{type(cur).__name__}: {cur}")
+            cur = cur.__cause__ or cur.__context__
+        result["error_chain"] = chain
 
     class WrapperContractError(Exception):
         pass
@@ -166,7 +179,7 @@ _RUNNER = textwrap.dedent(
             print(json.dumps(result))
             raise SystemExit(0)
     except Exception as e:
-        result["error"] = f"{type(e).__name__}: {e}"
+        _record_error(e)
         print(json.dumps(result))
         raise SystemExit(0)
 
@@ -198,7 +211,7 @@ _RUNNER = textwrap.dedent(
                 break
     except Exception as e:
         correct = False
-        result["error"] = f"{type(e).__name__}: {e}"
+        _record_error(e)
 
     result["compiled"] = produced_output
     result["correct"] = correct
@@ -269,7 +282,8 @@ def verify_triton(
     """Compile, run, and (if correct) time `submission_code` in a subprocess.
 
     Returns {"compiled", "correct", "max_diff", "speedup", "ref_ms", "kernel_ms",
-    "error", "trials", "device"}.
+    "error", "error_chain", "trials", "device", "binding"}; `error_chain` lists the
+    `__cause__`/`__context__` exceptions behind `error`, outermost first.
     """
     python = python or os.environ.get("RLM_VERIFY_PYTHON") or sys.executable
     _fail = lambda msg: {  # noqa: E731
@@ -280,8 +294,10 @@ def verify_triton(
         "ref_ms": None,
         "kernel_ms": None,
         "error": msg,
+        "error_chain": [],
         "trials": n_trials,
         "device": "?",
+        "binding": None,
     }
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)

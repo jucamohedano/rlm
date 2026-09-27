@@ -1,8 +1,12 @@
 """GPU stage: re-execute parsed traces in the rlm_train worker and emit SFT rows.
 
-Run inside a torch+triton container with this repo installed:
+Run inside a torch+triton container, importing `rlm_train` and `triton_rlm` from THIS
+checkout (the worker protocol here differs from older `rlm_train` installs):
 
-    uv run python scripts/ppbhatt_reexec.py parsed/traces.jsonl out_dir [--limit N] [--only KEY]
+    PYTHONPATH=<checkout>/training/src:<checkout>/training/environments/triton_rlm \
+      python scripts/ppbhatt_reexec.py parsed/traces.jsonl out_dir [--limit N] [--only KEY ...]
+
+The script refuses to start if either package resolves elsewhere.
 
 Per trace, one worker subprocess (persistent namespace across turns, exactly as
 in a rollout) wrapped in `VerifyingReplBackend`, so each turn's ```repl``` block
@@ -30,12 +34,19 @@ from __future__ import annotations
 import argparse
 import asyncio
 import collections
+import dataclasses
 import json
 from pathlib import Path
 from typing import Any
 
-from rlm_train.env import _format_repl_outputs, _pack_exec
-from rlm_train.repl.subprocess import SubprocessReplBackend
+import triton_rlm
+from rlm.utils.parsing import find_code_blocks
+from rlm.utils.prompts import (
+    RLM_SYSTEM_PROMPT,
+    QueryMetadata,
+    build_rlm_system_prompt,
+    build_user_prompt,
+)
 from triton_rlm.env import build_root_prompt, milestone_reward
 from triton_rlm.repl import VerifyingReplBackend
 from triton_rlm.trace_translate import (
@@ -48,16 +59,39 @@ from triton_rlm.trace_translate import (
     decide,
 )
 
-from rlm.utils.parsing import find_code_blocks
-from rlm.utils.prompts import (
-    RLM_SYSTEM_PROMPT,
-    QueryMetadata,
-    build_rlm_system_prompt,
-    build_user_prompt,
-)
+import rlm_train
+from rlm_train.env import _format_repl_outputs, _pack_exec
+from rlm_train.repl.base import ExecResult
+from rlm_train.repl.subprocess import SubprocessReplBackend
 
 # The worker only contacts the proxy for llm_query(); the traces never call it.
 DUMMY_PROXY_URL = "http://127.0.0.1:9"
+
+TRAINING_DIR = Path(__file__).resolve().parents[3]
+
+
+def check_source_tree() -> None:
+    """Both packages must come from this checkout: the worker subprocess is spawned as
+    `python -m rlm_train.worker`, so a stale editable install elsewhere silently changes
+    the exec protocol (no `exception` field, no `set_local`, no linecache-registered
+    compile) and every turn misclassifies."""
+    expected = {
+        "rlm_train": TRAINING_DIR / "src" / "rlm_train",
+        "triton_rlm": TRAINING_DIR / "environments" / "triton_rlm" / "triton_rlm",
+    }
+    bad = []
+    for name, pkg in (("rlm_train", rlm_train), ("triton_rlm", triton_rlm)):
+        actual = Path(pkg.__file__).resolve().parent
+        if actual != expected[name]:
+            bad.append(f"{name} imported from {actual}, expected {expected[name]}")
+    if "exception" not in {f.name for f in dataclasses.fields(ExecResult)}:
+        bad.append("rlm_train.repl.base.ExecResult has no `exception` field (stale rlm_train)")
+    if bad:
+        raise RuntimeError(
+            "wrong source tree:\n  "
+            + "\n  ".join(bad)
+            + f"\nrun with PYTHONPATH={TRAINING_DIR / 'src'}:{TRAINING_DIR / 'environments' / 'triton_rlm'}"
+        )
 
 
 def fence(code: str) -> str:
@@ -351,7 +385,9 @@ def main() -> None:
     )
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--only", nargs="*", default=None, help="sample_keys to process")
-    asyncio.run(main_async(ap.parse_args()))
+    args = ap.parse_args()
+    check_source_tree()
+    asyncio.run(main_async(args))
 
 
 if __name__ == "__main__":

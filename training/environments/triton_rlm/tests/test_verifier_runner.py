@@ -143,6 +143,22 @@ def test_root_module_is_the_uninstantiated_one(run) -> None:
     assert r["compiled"] and not r["correct"]
 
 
+def test_error_chain_records_the_wrapped_cause(run) -> None:
+    body = (
+        "_boom(x)\n\n"
+        "class CompilationError(Exception):\n    pass\n\n"
+        "def _boom(x):\n"
+        "    try:\n        raise TypeError('launch grid must be int')\n"
+        "    except TypeError as e:\n        raise CompilationError('at 3:4:') from e\n"
+    )
+    r = run(REF_SINGLE, submission("x", body))
+    assert not r["compiled"]
+    assert r["error"] == "CompilationError: at 3:4:"
+    assert r["error_chain"] == ["TypeError: launch grid must be int"]
+    r = run(REF_SINGLE, submission("x", "x.nope()"))
+    assert r["error"].startswith("AttributeError:") and r["error_chain"] == []
+
+
 def test_ambiguous_reference_is_rejected(run) -> None:
     ref = REF_MULTI.replace("self.block = BasicBlock()", "pass").replace("self.block(x)", "x * 2")
     r = run(ref, submission("x", "x * 2 + 1"))

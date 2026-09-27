@@ -76,6 +76,30 @@ def test_compatible_requires_same_class_and_exception() -> None:
     assert compatible(INC, TurnClass("incorrect", message="max diff 0.5"), 0.6)
 
 
+def test_compatible_matches_recorded_exception_anywhere_in_our_chain() -> None:
+    # kernelbook_1174 t0: their harness recorded the launch TypeError; Triton may surface it
+    # to us wrapped in CompilationError.
+    recorded = TurnClass("error", "TypeError", "'tuple' object cannot be interpreted as an integer")
+    ours = classify_ours(
+        None,
+        {
+            "compiled": False,
+            "correct": False,
+            "error": "CompilationError: at 13:4:\n    offsets = ...",
+            "error_chain": ["TypeError: 'tuple' object cannot be interpreted as an integer"],
+        },
+    )
+    assert ours.exc_type == "CompilationError"
+    assert ours.chain == (("TypeError", "'tuple' object cannot be interpreted as an integer"),)
+    assert compatible(recorded, ours, 0.6)
+    # same class in the chain but a different failure is still a mismatch
+    other = TurnClass(
+        "error", "CompilationError", "at 13:4:", chain=(("TypeError", "unsupported operand"),)
+    )
+    assert not compatible(recorded, other, 0.6)
+    assert not compatible(recorded, TurnClass("error", "CompilationError", "at 13:4:"), 0.6)
+
+
 def test_wrapper_contract_error_matches_only_recorded_arity_type_error() -> None:
     ours = TurnClass(
         "error",
