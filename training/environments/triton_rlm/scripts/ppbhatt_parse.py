@@ -86,7 +86,7 @@ def main() -> None:
         turn_hist[len(t.turns)] += 1
         lines.append(
             f"{t.sample_key:18s} cluster={t.cluster:3d} split={t.split:7s} turns={len(t.turns)} "
-            f"stop={t.stop_reason:17s} ops={len(t.ops):2d}  {classes}"
+            f"stop={t.stop_reason:17s} ops={len(t.ops):2d} root={t.root_class:24s} {classes}"
         )
     dup_clusters = [c for c, n in collections.Counter(clusters).items() if n > 1]
     summary = [

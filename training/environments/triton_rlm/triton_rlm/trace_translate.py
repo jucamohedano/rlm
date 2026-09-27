@@ -226,6 +226,56 @@ def extract_ops(pytorch_code: str) -> list[str]:
     return ops
 
 
+class AmbiguousReference(ValueError):
+    """The reference module does not have exactly one root nn.Module class."""
+
+
+def reference_root_class(pytorch_code: str) -> str:
+    """Name of the class the verifier instantiates as the reference model.
+
+    `Model` if defined (KernelBench). Otherwise the one torch-derived class (any
+    base rooted in a torch import, e.g. `nn.Module`, `nn.Conv1d`, `_Loss`, or a
+    local subclass of one) that no other class in the file instantiates:
+    KernelBook files define building blocks (e.g. `BasicBlock`) before the module
+    that uses them, and the module is the task. Zero or several such roots raise
+    `AmbiguousReference` rather than guess. The verifier applies the same rule at
+    runtime with `issubclass(cls, nn.Module)` and is authoritative.
+    """
+    tree = ast.parse(pytorch_code)
+    classes = {n.name: n for n in tree.body if isinstance(n, ast.ClassDef)}
+    if "Model" in classes:
+        return "Model"
+    torch_names = _torch_aliases(tree)
+
+    def is_module(cls: ast.ClassDef, seen: frozenset[str]) -> bool:
+        for base in cls.bases:
+            root = base
+            while isinstance(root, ast.Attribute):
+                root = root.value
+            name = root.id if isinstance(root, ast.Name) else ""
+            if name in torch_names:
+                return True
+            if name in classes and name not in seen:
+                if is_module(classes[name], seen | {cls.name}):
+                    return True
+        return False
+
+    referenced = {
+        node.id
+        for cls in classes.values()
+        for node in ast.walk(cls)
+        if isinstance(node, ast.Name) and node.id in classes and node.id != cls.name
+    }
+    roots = [
+        name
+        for name, cls in classes.items()
+        if is_module(cls, frozenset()) and name not in referenced
+    ]
+    if len(roots) != 1:
+        raise AmbiguousReference(f"expected exactly one root nn.Module class, found {roots}")
+    return roots[0]
+
+
 def normalize_pytorch(code: str) -> str:
     """Strip comments/docstrings and collapse whitespace so cosmetic edits dedupe."""
     out: list[str] = []
@@ -316,6 +366,7 @@ class ParsedTrace:
     pytorch_code: str
     stop_reason: str
     ops: list[str]
+    root_class: str
     cluster: int
     split: str
     turns: list[ParsedTurn] = field(default_factory=list)
@@ -343,6 +394,7 @@ def parse_trace(row: dict[str, Any], cluster: int, split: str) -> ParsedTrace:
         pytorch_code=row["pytorch_code"],
         stop_reason=row["stop_reason"],
         ops=extract_ops(row["pytorch_code"]),
+        root_class=reference_root_class(row["pytorch_code"]),
         cluster=cluster,
         split=split,
         turns=turns,

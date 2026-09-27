@@ -1,4 +1,6 @@
+import pytest
 from triton_rlm.trace_translate import (
+    AmbiguousReference,
     TurnClass,
     classify_ours,
     classify_recorded,
@@ -8,6 +10,7 @@ from triton_rlm.trace_translate import (
     dedupe_clusters,
     extract_code,
     normalize_pytorch,
+    reference_root_class,
 )
 
 ERR = TurnClass("error", "CompilationError", "at 12:4: def kernel(x_ptr, ...)")
@@ -109,6 +112,23 @@ def test_decide_correct_slow_prefix_and_faster_tail() -> None:
     assert decide([INC, FAST], [SLOW], 0.6).keep_end == 0
     # slow on the last turn -> keep
     assert decide([SLOW], [SLOW], 0.6).keep_end == 0
+
+
+def test_root_class_skips_building_blocks_and_rejects_ambiguity() -> None:
+    src = (
+        "import torch\nimport torch.nn as nn\n"
+        "class ShapeError(Exception):\n    pass\n"
+        "class BasicBlock(nn.Module):\n"
+        "    def __init__(self):\n        super(BasicBlock, self).__init__()\n"
+        "class Net(torch.nn.Module):\n"
+        "    def __init__(self):\n        super().__init__()\n        self.b = BasicBlock()\n"
+    )
+    assert reference_root_class(src) == "Net"
+    assert reference_root_class(src + "class Model(nn.Module):\n    pass\n") == "Model"
+    with pytest.raises(AmbiguousReference):
+        reference_root_class(src + "class Other(nn.Module):\n    pass\n")
+    with pytest.raises(AmbiguousReference):
+        reference_root_class("class NotAModule:\n    pass\n")
 
 
 def test_dedupe_ignores_comments_and_whitespace() -> None:

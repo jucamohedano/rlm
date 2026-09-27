@@ -40,6 +40,7 @@ from typing import Any
 
 _RUNNER = textwrap.dedent(
     """
+    import ast
     import importlib.util
     import json
     import sys
@@ -87,18 +88,35 @@ _RUNNER = textwrap.dedent(
         "device": device,
     }
 
-    def _target_class(mod):
-        if hasattr(mod, "Model"):
+    class AmbiguousReference(Exception):
+        pass
+
+    def _target_class(mod, source):
+        # `Model` (KernelBench) if defined; otherwise the one module-local nn.Module
+        # subclass that no other class in the file instantiates (KernelBook defines
+        # building blocks before the module that uses them). Never guess.
+        if isinstance(getattr(mod, "Model", None), type):
             return mod.Model
-        own = [
-            v for v in vars(mod).values()
+        own = {
+            k: v for k, v in vars(mod).items()
             if isinstance(v, type)
             and issubclass(v, torch.nn.Module)
             and v.__module__ == mod.__name__
-        ]
-        if not own:
-            raise AttributeError("reference defines neither `Model` nor an nn.Module subclass")
-        return own[-1]
+        }
+        tree = ast.parse(source)
+        classes = [n for n in tree.body if isinstance(n, ast.ClassDef)]
+        referenced = {
+            node.id
+            for cls in classes
+            for node in ast.walk(cls)
+            if isinstance(node, ast.Name) and node.id in own and node.id != cls.name
+        }
+        roots = [name for name in own if name not in referenced]
+        if len(roots) != 1:
+            raise AmbiguousReference(
+                f"reference must define exactly one root nn.Module class, found {roots}"
+            )
+        return own[roots[0]]
 
     def _init_args(init):
         if len(init) == 2 and isinstance(init[0], list) and isinstance(init[1], dict):
@@ -107,7 +125,7 @@ _RUNNER = textwrap.dedent(
 
     try:
         ref_mod = _load(REF_PATH, "reference")
-        Model = _target_class(ref_mod)
+        Model = _target_class(ref_mod, open(REF_PATH, encoding="utf-8").read())
         get_inputs = ref_mod.get_inputs
         get_init_inputs = getattr(ref_mod, "get_init_inputs", lambda: [])
         init_args, init_kwargs = _init_args(get_init_inputs())
