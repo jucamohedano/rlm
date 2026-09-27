@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import io
 import json
+import linecache
 import os
 import signal
 import sys
@@ -152,6 +153,7 @@ class Worker:
                 exec_timeout_s = 600.0
         self.exec_timeout_s = exec_timeout_s
         self._lock = threading.Lock()
+        self._exec_counter = 0
         self._last_final_answer: str | None = None
         self._context_count = 0
         self.globals: dict[str, Any] = {}
@@ -290,9 +292,24 @@ class Worker:
                 sys.stdout, sys.stderr = old_out, old_err
 
     def _exec_with_timeout(self, code: str, ns: dict[str, Any]) -> None:
+        """Execute a REPL block.
+
+        The block is compiled under a unique synthetic filename that is also
+        registered in ``linecache``. ``exec(code, ns, ns)`` would compile under
+        the placeholder ``<string>``, which no module can read back: Triton's
+        ``@triton.jit`` needs the function source and raises "should be defined
+        in a Python file", and tracebacks cannot quote a line the model can act
+        on. The name registered here and the name passed to ``compile`` must
+        match.
+        """
+        self._exec_counter += 1
+        fname = f"<rlm-repl-{self.rollout_id}-{self._exec_counter}>"
+        linecache.cache[fname] = (len(code), None, code.splitlines(True), fname)
+        ns.setdefault("__name__", "rlm_repl_kernel")
+
         timeout_s = self.exec_timeout_s
         if timeout_s <= 0 or not hasattr(signal, "SIGALRM"):
-            exec(code, ns, ns)  # noqa: S102
+            exec(compile(code, fname, "exec"), ns, ns)  # noqa: S102
             return
 
         def _on_alarm(signum, frame):  # noqa: ARG001
@@ -301,7 +318,7 @@ class Worker:
         old_handler = signal.signal(signal.SIGALRM, _on_alarm)
         signal.setitimer(signal.ITIMER_REAL, timeout_s)
         try:
-            exec(code, ns, ns)  # noqa: S102
+            exec(compile(code, fname, "exec"), ns, ns)  # noqa: S102
         finally:
             signal.setitimer(signal.ITIMER_REAL, 0)
             signal.signal(signal.SIGALRM, old_handler)
