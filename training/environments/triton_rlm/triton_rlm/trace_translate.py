@@ -145,11 +145,20 @@ def error_head_ratio(a: TurnClass, b: TurnClass) -> float:
     return difflib.SequenceMatcher(None, _norm_head(a.message), _norm_head(b.message)).ratio()
 
 
+# Python's own arity error on the entry-point call, i.e. the harness could not fill the
+# wrapper's signature. Our verifier reports the same failure mode as WrapperContractError.
+_ARITY_TYPE_ERROR = re.compile(
+    r"^\w+\(\) (missing \d+ required (positional|keyword-only) argument|takes \d+ positional argument)"
+)
+
+
 def compatible(recorded: TurnClass, ours: TurnClass, min_head_ratio: float) -> bool:
     if recorded.kind != ours.kind:
         return False
     if recorded.kind != "error":
         return True
+    if ours.exc_type == "WrapperContractError":
+        return recorded.exc_type == "TypeError" and bool(_ARITY_TYPE_ERROR.match(recorded.message))
     return recorded.exc_type == ours.exc_type and error_head_ratio(recorded, ours) >= min_head_ratio
 
 

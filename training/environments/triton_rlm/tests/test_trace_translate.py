@@ -76,6 +76,41 @@ def test_compatible_requires_same_class_and_exception() -> None:
     assert compatible(INC, TurnClass("incorrect", message="max diff 0.5"), 0.6)
 
 
+def test_wrapper_contract_error_matches_only_recorded_arity_type_error() -> None:
+    ours = TurnClass(
+        "error",
+        "WrapperContractError",
+        "triton_forward requires positional args ['x']; the harness passes 1 input tensor(s)",
+    )
+    for msg in (
+        "triton_kernel_wrapper() missing 1 required positional argument: 'w0'",
+        "triton_kernel_wrapper() missing 2 required keyword-only arguments: 'weight' and 'bias'",
+        "triton_kernel_wrapper() takes 1 positional argument but 3 were given",
+    ):
+        assert compatible(TurnClass("error", "TypeError", msg), ours, 0.6)
+    assert not compatible(
+        TurnClass("error", "TypeError", "'tuple' object cannot be interpreted as an integer"),
+        ours,
+        0.6,
+    )
+    assert not compatible(
+        TurnClass("error", "TypeError", "Identity.__init__() got an unexpected keyword argument"),
+        ours,
+        0.6,
+    )
+    assert not compatible(ERR, ours, 0.6)
+    # the other direction is unchanged: a plain TypeError of ours is not a contract error
+    assert not compatible(
+        TurnClass(
+            "error",
+            "TypeError",
+            "triton_kernel_wrapper() missing 1 required positional argument: 'w0'",
+        ),
+        TurnClass("error", "TypeError", "'tuple' object cannot be interpreted as an integer"),
+        0.6,
+    )
+
+
 def test_decide_first_shot_correct() -> None:
     assert decide([FAST], [FAST], 0.6).action == "keep"
     assert decide([FAST], [FAST], 0.6).keep_end == 0
