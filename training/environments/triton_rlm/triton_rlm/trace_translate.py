@@ -57,6 +57,25 @@ SUBMIT_IDIOM = 'answer["content"] = kernel_src\nanswer["ready"] = True'
 
 Kind = Literal["error", "incorrect", "correct_slow", "correct_fast"]
 
+# Strings that exist only in the source harness (its prompt, driver and feedback).
+# None may appear in an emitted trajectory: a hit in our own prompt/REPL text is a
+# translation bug; a hit in the teacher's code means that turn was written against
+# their feedback text, not ours.
+SOURCE_HARNESS_MARKERS = (
+    "n_required",
+    "/root/modal_app.py",
+    "benchmark_kernelbench",
+    "Compilation/runtime error:",
+    "Incorrect output",
+    "Correct but slow",
+    "TRITON PRIMER",
+)
+
+
+def source_harness_markers(text: str) -> list[str]:
+    return [m for m in SOURCE_HARNESS_MARKERS if m in text]
+
+
 _TRITON_BLOCK = re.compile(r"<triton>\s*\n?(.*?)\n?\s*</triton>", re.S)
 _EXC_HEAD = re.compile(r"^([A-Za-z_][\w.]*(?:Error|Exception|Exit|Interrupt|Warning)?)\s*:\s*(.*)$")
 

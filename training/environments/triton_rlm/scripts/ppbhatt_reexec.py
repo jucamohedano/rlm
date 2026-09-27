@@ -57,6 +57,7 @@ from triton_rlm.trace_translate import (
     TurnClass,
     classify_ours,
     decide,
+    source_harness_markers,
 )
 
 import rlm_train
@@ -148,6 +149,7 @@ async def reexec_trace(
                     "stdout": result.stdout,
                     "stderr": result.stderr,
                     "execution_time": result.execution_time,
+                    "locals_keys": result.locals_keys,
                     "verify": verify,
                 }
             )
@@ -180,6 +182,16 @@ async def reexec_trace(
     keep_end = decision.keep_end
     assert keep_end is not None
     kept = history[: history_end_after_turn[keep_end]]
+    leaks = [
+        f"message {i} ({msg['role']}): {m!r}"
+        for i, msg in enumerate(kept)
+        for m in source_harness_markers(msg["content"])
+    ]
+    if leaks:
+        out["decision"] = dataclasses.asdict(
+            Decision("drop", None, f"source-harness marker at {'; '.join(leaks[:3])}")
+        )
+        return out
     kept.append(
         build_user_prompt(
             root_prompt=root_prompt, iteration=keep_end + 1, max_iterations=max_iterations
