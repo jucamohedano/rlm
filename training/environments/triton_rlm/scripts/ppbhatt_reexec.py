@@ -12,6 +12,9 @@ rows are byte-identical to what the harness would show a policy.
 
 Writes to out_dir:
     exec_log.jsonl          every executed turn: our ExecResult + verifier report + class
+    trace_summary.jsonl     one row per trace: the trajectory-level rollup (kept_prefix_len,
+                            first_correct_turn, repair, final_class, truncation)
+    summary.json            aggregate counts over the run (yield, repair share, drop reasons)
     reexec_report.txt       per trace: recorded vs our classes, decision, first correct turn
     sft_rows.<split>.jsonl  one row per assistant turn (assistant_loss_only_last: true)
     sft_trajectories.<split>.jsonl  one row per trajectory (all assistant turns supervised)
@@ -135,6 +138,8 @@ async def reexec_trace(
         "turn_logs": turn_logs,
         "messages": None,
         "reward": None,
+        "first_correct_turn": None,
+        "repair": False,
     }
     if decision.action != "keep":
         return out
@@ -149,9 +154,65 @@ async def reexec_trace(
     kept.append({"role": "assistant", "content": fence(SUBMIT_IDIOM)})
     out["messages"] = kept
     out["reward"] = milestone_reward(turn_logs[keep_end]["verify"])
-    out["first_correct_turn"] = next(i for i, c in enumerate(ours) if c.kind.startswith("correct"))
-    out["repair"] = any(c.kind in ("error", "incorrect") for c in ours[:keep_end])
+    first_correct = next(i for i, c in enumerate(ours) if c.kind.startswith("correct"))
+    out["first_correct_turn"] = first_correct
+    # A repair is a failed turn followed by a different kernel that we verified correct
+    # (not the same source re-run, which their harness could produce and ours cannot).
+    out["repair"] = any(
+        c.kind in ("error", "incorrect") and trace.turns[i].code != trace.turns[first_correct].code
+        for i, c in enumerate(ours[:first_correct])
+    )
     return out
+
+
+def trace_summary(trace: ParsedTrace, res: dict[str, Any]) -> dict[str, Any]:
+    """Trajectory-level rollup: the unit the training decision is made on."""
+    d = res["decision"]
+    kept = d["action"] == "keep"
+    keep_end = d["keep_end"] if kept else None
+    ours = res["ours"]
+    return {
+        "sample_key": res["sample_key"],
+        "cluster": res["cluster"],
+        "split": res["split"],
+        "n_source_turns": len(trace.turns),
+        "n_executed_turns": len(ours),
+        "recorded_classes": res["recorded"],
+        "our_classes": ours,
+        "kept": kept,
+        "kept_prefix_len": keep_end + 1 if kept else 0,
+        "first_correct_turn": res["first_correct_turn"],
+        "repair": res["repair"],
+        "final_class": ours[keep_end] if kept else (ours[-1] if ours else None),
+        "truncated_at": None if kept else len(ours) - 1,
+        "drop_reason": None if kept else d["reason"],
+        "reward": res["reward"],
+    }
+
+
+def aggregate(summaries: list[dict[str, Any]]) -> dict[str, Any]:
+    kept = [s for s in summaries if s["kept"]]
+    repair = [s for s in kept if s["repair"]]
+    our_errors = collections.Counter(
+        c for s in summaries for c in s["our_classes"] if c.startswith("error[")
+    )
+    return {
+        "traces_reexecuted": len(summaries),
+        "traces_with_verified_kernel": len(kept),
+        "trajectories_with_repair": len(repair),
+        "repair_share": len(repair) / len(kept) if kept else None,
+        "kept_kernel_turns": sum(s["kept_prefix_len"] for s in kept),
+        "kept_ending_correct_fast": sum(s["final_class"] == "correct_fast" for s in kept),
+        "distinct_tasks_kept": len({s["cluster"] for s in kept}),
+        "first_correct_turn_hist": dict(collections.Counter(s["first_correct_turn"] for s in kept)),
+        "drop_reasons": dict(
+            collections.Counter(
+                s["drop_reason"].split(" at ")[0] for s in summaries if not s["kept"]
+            )
+        ),
+        "our_error_classes": dict(our_errors.most_common()),
+        "per_split": dict(collections.Counter(s["split"] for s in kept)),
+    }
 
 
 def sft_rows(res: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
@@ -209,8 +270,12 @@ async def main_async(args: argparse.Namespace) -> None:
     out.mkdir(parents=True, exist_ok=True)
 
     results: list[dict[str, Any]] = []
+    summaries: list[dict[str, Any]] = []
     lines: list[str] = []
-    with (out / "exec_log.jsonl").open("w", encoding="utf-8") as log:
+    with (
+        (out / "exec_log.jsonl").open("w", encoding="utf-8") as log,
+        (out / "trace_summary.jsonl").open("w", encoding="utf-8") as summ,
+    ):
         for n, trace in enumerate(traces, 1):
             res = await reexec_trace(
                 trace, max_iterations=args.max_iterations, min_head_ratio=args.min_head_ratio
@@ -218,6 +283,9 @@ async def main_async(args: argparse.Namespace) -> None:
             results.append(res)
             log.write(json.dumps({k: v for k, v in res.items() if k != "messages"}) + "\n")
             log.flush()
+            summaries.append(trace_summary(trace, res))
+            summ.write(json.dumps(summaries[-1]) + "\n")
+            summ.flush()
             d = res["decision"]
             verdict = f"KEEP turns 0..{d['keep_end']}" if d["action"] == "keep" else "DROP"
             line = (
@@ -265,17 +333,9 @@ async def main_async(args: argparse.Namespace) -> None:
                     + "\n"
                 )
 
-    n_kernel_turns = sum(r["decision"]["keep_end"] + 1 for r in kept)
-    summary = [
-        f"traces re-executed: {len(results)}",
-        f"traces kept: {len(kept)}  dropped: {len(results) - len(kept)}",
-        f"kept kernel turns: {n_kernel_turns}  (+{len(kept)} submit turns)",
-        f"kept with error/incorrect -> recovery: {sum(r['repair'] for r in kept)}",
-        f"kept ending correct_fast: {sum(r['ours'][r['decision']['keep_end']] == 'correct_fast' for r in kept)}",
-        f"distinct tasks (dedupe clusters) kept: {len({r['cluster'] for r in kept})}",
-        f"drop reasons: {dict(collections.Counter(r['decision']['reason'].split(' at ')[0] for r in results if r['decision']['action'] != 'keep'))}",
-        f"per split: {dict(collections.Counter(r['split'] for r in kept))}",
-    ]
+    agg = aggregate(summaries)
+    (out / "summary.json").write_text(json.dumps(agg, indent=2) + "\n", encoding="utf-8")
+    summary = [f"{k}: {v}" for k, v in agg.items()]
     report = "\n\n".join(lines) + "\n\n" + "\n".join(summary) + "\n"
     (out / "reexec_report.txt").write_text(report, encoding="utf-8")
     print("\n".join(summary))
