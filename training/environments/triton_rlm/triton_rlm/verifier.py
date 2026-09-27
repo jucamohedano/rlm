@@ -9,8 +9,15 @@ Submission contract (what the model is trained to emit):
 
         def triton_forward(*tensors) -> torch.Tensor
 
-    The reference module is loaded from a file and provides `Model`,
-    `get_inputs()` and `get_init_inputs()` (KernelBench style).
+    `tensors` = the reference module's forward inputs (`get_inputs()`), followed
+    by its parameters in `module.parameters()` order when it has any. A
+    parameter-free module therefore gets exactly the forward inputs.
+
+    The reference module is loaded from a file and provides `get_inputs()` and
+    `get_init_inputs()`. Two source formats are accepted:
+      * KernelBench: class `Model`, `get_init_inputs()` -> positional list;
+      * KernelBook: the last `nn.Module` subclass defined in the file is the
+        target, `get_init_inputs()` -> `[args_list, kwargs_dict]`.
 
 Speed protocol (see notes/reward-design.md):
     only measured when the kernel is correct; `triton.testing.do_bench` with
@@ -80,11 +87,30 @@ _RUNNER = textwrap.dedent(
         "device": device,
     }
 
+    def _target_class(mod):
+        if hasattr(mod, "Model"):
+            return mod.Model
+        own = [
+            v for v in vars(mod).values()
+            if isinstance(v, type)
+            and issubclass(v, torch.nn.Module)
+            and v.__module__ == mod.__name__
+        ]
+        if not own:
+            raise AttributeError("reference defines neither `Model` nor an nn.Module subclass")
+        return own[-1]
+
+    def _init_args(init):
+        if len(init) == 2 and isinstance(init[0], list) and isinstance(init[1], dict):
+            return init[0], init[1]
+        return list(init), {}
+
     try:
         ref_mod = _load(REF_PATH, "reference")
-        Model = ref_mod.Model
+        Model = _target_class(ref_mod)
         get_inputs = ref_mod.get_inputs
         get_init_inputs = getattr(ref_mod, "get_init_inputs", lambda: [])
+        init_args, init_kwargs = _init_args(get_init_inputs())
         sub_mod = _load(SUB_PATH, "submission")
         triton_forward = sub_mod.triton_forward
         if "@triton.jit" not in sub_source:
@@ -104,12 +130,13 @@ _RUNNER = textwrap.dedent(
     produced_output = False
     try:
         for _ in range(N_TRIALS):
-            model = Model(*get_init_inputs()).to(device)
+            model = Model(*init_args, **init_kwargs).to(device)
             model.eval()
             inputs = [t.to(device) for t in get_inputs()]
+            params = [p.detach() for p in model.parameters()]
             with torch.no_grad():
                 ref = model(*inputs)
-                out = triton_forward(*inputs)   # first call triggers the Triton JIT
+                out = triton_forward(*inputs, *params)   # first call triggers the Triton JIT
             produced_output = True
             if tuple(ref.shape) != tuple(out.shape):
                 correct = False
@@ -137,7 +164,7 @@ _RUNNER = textwrap.dedent(
                     return model(*inputs)
             def kernel_fn():
                 with torch.no_grad():
-                    return triton_forward(*inputs)
+                    return triton_forward(*inputs, *params)
             ref_ms = float(
                 triton.testing.do_bench(ref_fn, warmup=25, rep=100, return_mode="median")
             )
@@ -154,6 +181,31 @@ _RUNNER = textwrap.dedent(
     raise SystemExit(0)
     """
 )
+
+
+_MAX_REPORT_ERROR_CHARS = 2000
+
+
+def format_verify_report(result: dict[str, Any]) -> str:
+    """Render a `verify_triton` result as the text the model sees in the REPL output."""
+    lines = [
+        "[verifier] triton_forward vs reference module",
+        f"  compiled: {bool(result.get('compiled'))}",
+        f"  correct: {bool(result.get('correct'))}",
+    ]
+    if result.get("max_diff") is not None:
+        lines.append(f"  max_abs_diff: {float(result['max_diff']):.3e}")
+    if result.get("speedup") is not None:
+        lines.append(
+            f"  speedup: {float(result['speedup']):.2f}x "
+            f"(reference {float(result['ref_ms']):.4f} ms, kernel {float(result['kernel_ms']):.4f} ms)"
+        )
+    error = str(result.get("error") or "")
+    if error:
+        if len(error) > _MAX_REPORT_ERROR_CHARS:
+            error = error[:_MAX_REPORT_ERROR_CHARS] + "..."
+        lines.append(f"  error: {error}")
+    return "\n".join(lines)
 
 
 def verify_triton(
@@ -173,10 +225,16 @@ def verify_triton(
     "error", "trials", "device"}.
     """
     python = python or os.environ.get("RLM_VERIFY_PYTHON") or sys.executable
-    _fail = lambda msg: {   # noqa: E731
-        "compiled": False, "correct": False, "max_diff": None,
-        "speedup": None, "ref_ms": None, "kernel_ms": None,
-        "error": msg, "trials": n_trials, "device": "?",
+    _fail = lambda msg: {  # noqa: E731
+        "compiled": False,
+        "correct": False,
+        "max_diff": None,
+        "speedup": None,
+        "ref_ms": None,
+        "kernel_ms": None,
+        "error": msg,
+        "trials": n_trials,
+        "device": "?",
     }
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
@@ -187,9 +245,13 @@ def verify_triton(
         sub_path.write_text(submission_code, encoding="utf-8")
         runner_path.write_text(_RUNNER, encoding="utf-8")
         cmd = [
-            python, str(runner_path),
-            str(ref_path), str(sub_path),
-            str(int(n_trials)), repr(float(atol)), repr(float(rtol)),
+            python,
+            str(runner_path),
+            str(ref_path),
+            str(sub_path),
+            str(int(n_trials)),
+            repr(float(atol)),
+            repr(float(rtol)),
         ]
         try:
             proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s, cwd=cwd)
