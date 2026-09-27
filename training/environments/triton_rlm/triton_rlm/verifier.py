@@ -42,6 +42,7 @@ _RUNNER = textwrap.dedent(
     """
     import ast
     import importlib.util
+    import inspect
     import json
     import sys
 
@@ -86,10 +87,36 @@ _RUNNER = textwrap.dedent(
         "error": "",
         "trials": N_TRIALS,
         "device": device,
+        "binding": None,
     }
 
     class AmbiguousReference(Exception):
         pass
+
+    class WrapperContractError(Exception):
+        pass
+
+    def _check_binding(fn, n_inputs, n_params):
+        # The harness calls triton_forward(*inputs, *model.parameters()). Those must
+        # fill exactly the required positional slots: never let a parameter tensor
+        # spill into a defaulted hyper-parameter slot (silent mis-binding) and never
+        # leave a required slot empty.
+        params = list(inspect.signature(fn).parameters.values())
+        if any(p.kind == p.VAR_POSITIONAL for p in params):
+            return
+        required = [
+            p.name
+            for p in params
+            if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD) and p.default is p.empty
+        ]
+        required_kw = [p.name for p in params if p.kind == p.KEYWORD_ONLY and p.default is p.empty]
+        if len(required) != n_inputs + n_params or required_kw:
+            raise WrapperContractError(
+                f"triton_forward requires positional args {required}"
+                + (f" and keyword-only {required_kw}" if required_kw else "")
+                + f"; the harness passes {n_inputs} input tensor(s) from get_inputs() "
+                f"followed by {n_params} parameter tensor(s) from module.parameters()"
+            )
 
     def _target_class(mod, source):
         # `Model` (KernelBench) if defined; otherwise the one module-local nn.Module
@@ -150,8 +177,10 @@ _RUNNER = textwrap.dedent(
         for _ in range(N_TRIALS):
             model = Model(*init_args, **init_kwargs).to(device)
             model.eval()
-            inputs = [t.to(device) for t in get_inputs()]
+            inputs = [t.to(device) if isinstance(t, torch.Tensor) else t for t in get_inputs()]
             params = [p.detach() for p in model.parameters()]
+            result["binding"] = {"inputs": len(inputs), "parameters": len(params)}
+            _check_binding(triton_forward, len(inputs), len(params))
             with torch.no_grad():
                 ref = model(*inputs)
                 out = triton_forward(*inputs, *params)   # first call triggers the Triton JIT
