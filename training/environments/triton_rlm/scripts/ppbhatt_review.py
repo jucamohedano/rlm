@@ -588,16 +588,23 @@ def main() -> None:
     idx += [f"- `{tok}`: {n}" for tok, n in cited.most_common(40)]
     idx.append("")
 
-    sites = collections.Counter(
-        divergence_site(r, row)
-        for r in records
-        for row in r["per_turn"]
-        if "DIVERGENT_INCOMPATIBLE" in row["flags"]
-    )
+    site_traces: dict[str, set[str]] = collections.defaultdict(set)
+    sites: collections.Counter[str] = collections.Counter()
+    for r in records:
+        for row in r["per_turn"]:
+            if "DIVERGENT_INCOMPATIBLE" in row["flags"]:
+                site = divergence_site(r, row)
+                sites[site] += 1
+                site_traces[site].add(r["sample_key"])
     idx += [
         "## DIVERGENT_INCOMPATIBLE turns by position (kept_failed must be 0)",
         "",
-        *[f"- {site}: {n}" for site, n in sorted(sites.items())],
+        "turns / traces; `kept_*` traces are the kept trajectories whose *emitted* prefix",
+        "contains a recorded-vs-ours divergence somewhere.",
+        "",
+        *[f"- {site}: {n} / {len(site_traces[site])}" for site, n in sorted(sites.items())],
+        f"- kept traces with a divergence in the emitted prefix: "
+        f"{len(site_traces['kept_failed'] | site_traces['kept_correct'])}",
         "",
     ]
 
