@@ -17,17 +17,22 @@ pool file with the hits removed. Exit code 1 if there is any hit at --threshold.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
-from triton_rlm.trace_translate import (  # noqa: E402
-    dedupe_clusters,
-    minhash_signature,
-    normalize_pytorch,
-)
+# Load trace_translate by path: it is stdlib-only, while `import triton_rlm` pulls in
+# env -> rlm_train -> torch, which this data-vs-data check does not need.
+_TT = Path(__file__).resolve().parents[1] / "triton_rlm" / "trace_translate.py"
+_spec = importlib.util.spec_from_file_location("trace_translate", _TT)
+assert _spec is not None and _spec.loader is not None
+_tt = importlib.util.module_from_spec(_spec)
+sys.modules["trace_translate"] = _tt
+_spec.loader.exec_module(_tt)
+dedupe_clusters = _tt.dedupe_clusters
+minhash_signature = _tt.minhash_signature
+normalize_pytorch = _tt.normalize_pytorch
 
 
 def load_jsonl(path: Path) -> list[dict]:
