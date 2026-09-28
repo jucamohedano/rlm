@@ -76,3 +76,5 @@ def test_disjoint_pool_exits_clean(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     assert report["ppbhatt_clusters"] == 1
     assert report["pools"][str(pool)]["hits_at_threshold"] == []
     assert report["pools"][str(pool)]["near_matches"] == []
+    assert report["pools"][str(pool)]["disjoint_written"] is None
+    assert not (tmp_path / "lvl1_disjoint.jsonl").exists()

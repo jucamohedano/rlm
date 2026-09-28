@@ -10,8 +10,9 @@ Two passes: the parse rule (union clustered at --threshold, default 0.85; a pool
 if it lands in a cluster with any ppbhatt task) and a looser report of every pool task whose
 best estimated Jaccard against any ppbhatt task is >= --report-above (default 0.7), so the
 threshold's cliff is visible. Hits are resolved by dropping the POOL task (the ppbhatt side is
-verified SFT data; the pool is the cheap side): `<pool>_disjoint.jsonl` is written next to each
-pool file with the hits removed. Exit code 1 if there is any hit at --threshold.
+verified SFT data; the pool is the cheap side): when a pool has hits, `<pool>_disjoint.jsonl` is
+written next to it with the hits removed (a 0-hit pool is left alone, so no duplicate manifests).
+Exit code 1 if there is any hit at --threshold.
 """
 
 from __future__ import annotations
@@ -93,21 +94,23 @@ def main() -> None:
                     }
                 )
         any_hit |= bool(hits)
-        survivors = [r for i, r in enumerate(pool) if i not in set(hits)]
-        disjoint = pool_path.with_name(pool_path.stem + "_disjoint.jsonl")
-        with disjoint.open("w", encoding="utf-8") as f:
-            for r in survivors:
-                f.write(json.dumps(r) + "\n")
+        disjoint: Path | None = None
+        if hits:
+            survivors = [r for i, r in enumerate(pool) if i not in set(hits)]
+            disjoint = pool_path.with_name(pool_path.stem + "_disjoint.jsonl")
+            with disjoint.open("w", encoding="utf-8") as f:
+                for r in survivors:
+                    f.write(json.dumps(r) + "\n")
         report["pools"][str(pool_path)] = {
             "tasks": len(pool),
             "hits_at_threshold": [pool[i]["_task_id"] for i in hits],
             "near_matches": sorted(near, key=lambda d: -d["est_jaccard"]),
-            "disjoint_written": str(disjoint),
-            "disjoint_tasks": len(survivors),
+            "disjoint_written": None if disjoint is None else str(disjoint),
         }
         print(
             f"{pool_path}: {len(pool)} tasks, {len(hits)} hit(s) at {args.threshold}, "
-            f"{len(near)} within {args.report_above}; wrote {disjoint} ({len(survivors)})"
+            f"{len(near)} within {args.report_above}"
+            + (f"; wrote {disjoint} ({len(pool) - len(hits)})" if disjoint else "")
         )
 
     args.out.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
