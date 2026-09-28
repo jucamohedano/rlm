@@ -114,10 +114,14 @@ class SubprocessReplBackend(ReplBackend):
         return ExecResult(
             stdout=result.get("stdout", ""),
             stderr=result.get("stderr", ""),
+            exception=result.get("exception"),
             final_answer=result.get("final_answer"),
             execution_time=float(result.get("execution_time") or 0.0),
             locals_keys=list(result.get("locals_keys") or []),
         )
+
+    async def set_local(self, name: str, value: Any) -> None:
+        await self._request({"type": "set_local", "name": name, "value": value})
 
     async def _request(self, payload: dict[str, Any]) -> dict[str, Any]:
         if self._proc is None:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import io
 import json
+import linecache
 import os
 import signal
 import sys
@@ -154,6 +155,7 @@ class Worker:
         self._lock = threading.Lock()
         self._last_final_answer: str | None = None
         self._context_count = 0
+        self._exec_count = 0
         self.globals: dict[str, Any] = {}
         self.locals: dict[str, Any] = {}
         self._setup_namespace()
@@ -289,10 +291,27 @@ class Worker:
             finally:
                 sys.stdout, sys.stderr = old_out, old_err
 
+    def set_local(self, name: str, value: Any) -> None:
+        if name in RESERVED_TOOL_NAMES:
+            raise ValueError(f"cannot set reserved name {name!r}")
+        self.locals[name] = value
+
+    def _compile(self, code: str):
+        # Register the block's source under a unique pseudo-filename so that
+        # `inspect.getsource` works on functions defined in it. `@triton.jit`
+        # needs the source text to build its AST; with a plain `exec(code)` it
+        # raises OSError("could not get source code"). Tracebacks also show the
+        # offending line as a bonus.
+        self._exec_count += 1
+        filename = f"<repl-{self.rollout_id}-{self._exec_count}>"
+        linecache.cache[filename] = (len(code), None, code.splitlines(keepends=True), filename)
+        return compile(code, filename, "exec")
+
     def _exec_with_timeout(self, code: str, ns: dict[str, Any]) -> None:
+        code_obj = self._compile(code)
         timeout_s = self.exec_timeout_s
         if timeout_s <= 0 or not hasattr(signal, "SIGALRM"):
-            exec(code, ns, ns)  # noqa: S102
+            exec(code_obj, ns, ns)  # noqa: S102
             return
 
         def _on_alarm(signum, frame):  # noqa: ARG001
@@ -301,13 +320,14 @@ class Worker:
         old_handler = signal.signal(signal.SIGALRM, _on_alarm)
         signal.setitimer(signal.ITIMER_REAL, timeout_s)
         try:
-            exec(code, ns, ns)  # noqa: S102
+            exec(code_obj, ns, ns)  # noqa: S102
         finally:
             signal.setitimer(signal.ITIMER_REAL, 0)
             signal.signal(signal.SIGALRM, old_handler)
 
     def execute(self, code: str) -> dict[str, Any]:
         start = time.perf_counter()
+        exception: str | None = None
         with self._capture_output() as (out_buf, err_buf):
             try:
                 combined = {**self.globals, **self.locals}
@@ -319,8 +339,9 @@ class Worker:
                 stdout = out_buf.getvalue()
                 stderr = err_buf.getvalue()
             except BaseException as e:  # noqa: BLE001
+                exception = f"{type(e).__name__}: {e}"
                 stdout = out_buf.getvalue()
-                stderr = err_buf.getvalue() + f"\n{type(e).__name__}: {e}"
+                stderr = err_buf.getvalue() + f"\n{exception}"
                 tb = traceback.format_exc()
                 if tb and tb.strip() and tb not in stderr:
                     stderr = stderr + "\n" + tb
@@ -336,6 +357,7 @@ class Worker:
         return {
             "stdout": stdout,
             "stderr": stderr,
+            "exception": exception,
             "final_answer": final_answer,
             "execution_time": time.perf_counter() - start,
             "locals_keys": simple_keys,
@@ -403,6 +425,12 @@ def main() -> None:
                         "error": f"bootstrap failed: {e}\n{traceback.format_exc()}",
                     }
                 )
+        elif kind == "set_local":
+            try:
+                worker.set_local(req["name"], req.get("value"))
+                _send({"id": rid, "ok": True})
+            except BaseException as e:  # noqa: BLE001
+                _send({"id": rid, "ok": False, "error": f"set_local failed: {e}"})
         elif kind == "shutdown":
             _send({"id": rid, "ok": True})
             return

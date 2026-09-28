@@ -9,8 +9,15 @@ Submission contract (what the model is trained to emit):
 
         def triton_forward(*tensors) -> torch.Tensor
 
-    The reference module is loaded from a file and provides `Model`,
-    `get_inputs()` and `get_init_inputs()` (KernelBench style).
+    `tensors` = the reference module's forward inputs (`get_inputs()`), followed
+    by its parameters in `module.parameters()` order when it has any. A
+    parameter-free module therefore gets exactly the forward inputs.
+
+    The reference module is loaded from a file and provides `get_inputs()` and
+    `get_init_inputs()`. Two source formats are accepted:
+      * KernelBench: class `Model`, `get_init_inputs()` -> positional list;
+      * KernelBook: the last `nn.Module` subclass defined in the file is the
+        target, `get_init_inputs()` -> `[args_list, kwargs_dict]`.
 
 Speed protocol (see notes/reward-design.md):
     only measured when the kernel is correct; `triton.testing.do_bench` with
@@ -33,7 +40,9 @@ from typing import Any
 
 _RUNNER = textwrap.dedent(
     """
+    import ast
     import importlib.util
+    import inspect
     import json
     import sys
 
@@ -76,15 +85,90 @@ _RUNNER = textwrap.dedent(
         "ref_ms": None,
         "kernel_ms": None,
         "error": "",
+        "error_chain": [],
         "trials": N_TRIALS,
         "device": device,
+        "binding": None,
     }
+
+    class AmbiguousReference(Exception):
+        pass
+
+    def _record_error(e):
+        # Triton wraps the offending Python exception in CompilationError (`raise ... from e`);
+        # keep the whole chain so the failure can be matched by its underlying class too.
+        result["error"] = f"{type(e).__name__}: {e}"
+        chain, seen = [], set()
+        cur = e.__cause__ or e.__context__
+        while cur is not None and id(cur) not in seen:
+            seen.add(id(cur))
+            chain.append(f"{type(cur).__name__}: {cur}")
+            cur = cur.__cause__ or cur.__context__
+        result["error_chain"] = chain
+
+    class WrapperContractError(Exception):
+        pass
+
+    def _check_binding(fn, n_inputs, n_params):
+        # The harness calls triton_forward(*inputs, *model.parameters()). Those must
+        # fill exactly the required positional slots: never let a parameter tensor
+        # spill into a defaulted hyper-parameter slot (silent mis-binding) and never
+        # leave a required slot empty.
+        params = list(inspect.signature(fn).parameters.values())
+        if any(p.kind == p.VAR_POSITIONAL for p in params):
+            return
+        required = [
+            p.name
+            for p in params
+            if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD) and p.default is p.empty
+        ]
+        required_kw = [p.name for p in params if p.kind == p.KEYWORD_ONLY and p.default is p.empty]
+        if len(required) != n_inputs + n_params or required_kw:
+            raise WrapperContractError(
+                f"triton_forward requires positional args {required}"
+                + (f" and keyword-only {required_kw}" if required_kw else "")
+                + f"; the harness passes {n_inputs} input tensor(s) from get_inputs() "
+                f"followed by {n_params} parameter tensor(s) from module.parameters()"
+            )
+
+    def _target_class(mod, source):
+        # `Model` (KernelBench) if defined; otherwise the one module-local nn.Module
+        # subclass that no other class in the file instantiates (KernelBook defines
+        # building blocks before the module that uses them). Never guess.
+        if isinstance(getattr(mod, "Model", None), type):
+            return mod.Model
+        own = {
+            k: v for k, v in vars(mod).items()
+            if isinstance(v, type)
+            and issubclass(v, torch.nn.Module)
+            and v.__module__ == mod.__name__
+        }
+        tree = ast.parse(source)
+        classes = [n for n in tree.body if isinstance(n, ast.ClassDef)]
+        referenced = {
+            node.id
+            for cls in classes
+            for node in ast.walk(cls)
+            if isinstance(node, ast.Name) and node.id in own and node.id != cls.name
+        }
+        roots = [name for name in own if name not in referenced]
+        if len(roots) != 1:
+            raise AmbiguousReference(
+                f"reference must define exactly one root nn.Module class, found {roots}"
+            )
+        return own[roots[0]]
+
+    def _init_args(init):
+        if len(init) == 2 and isinstance(init[0], list) and isinstance(init[1], dict):
+            return init[0], init[1]
+        return list(init), {}
 
     try:
         ref_mod = _load(REF_PATH, "reference")
-        Model = ref_mod.Model
+        Model = _target_class(ref_mod, open(REF_PATH, encoding="utf-8").read())
         get_inputs = ref_mod.get_inputs
         get_init_inputs = getattr(ref_mod, "get_init_inputs", lambda: [])
+        init_args, init_kwargs = _init_args(get_init_inputs())
         sub_mod = _load(SUB_PATH, "submission")
         triton_forward = sub_mod.triton_forward
         if "@triton.jit" not in sub_source:
@@ -95,7 +179,7 @@ _RUNNER = textwrap.dedent(
             print(json.dumps(result))
             raise SystemExit(0)
     except Exception as e:
-        result["error"] = f"{type(e).__name__}: {e}"
+        _record_error(e)
         print(json.dumps(result))
         raise SystemExit(0)
 
@@ -104,12 +188,15 @@ _RUNNER = textwrap.dedent(
     produced_output = False
     try:
         for _ in range(N_TRIALS):
-            model = Model(*get_init_inputs()).to(device)
+            model = Model(*init_args, **init_kwargs).to(device)
             model.eval()
-            inputs = [t.to(device) for t in get_inputs()]
+            inputs = [t.to(device) if isinstance(t, torch.Tensor) else t for t in get_inputs()]
+            params = [p.detach() for p in model.parameters()]
+            result["binding"] = {"inputs": len(inputs), "parameters": len(params)}
+            _check_binding(triton_forward, len(inputs), len(params))
             with torch.no_grad():
                 ref = model(*inputs)
-                out = triton_forward(*inputs)   # first call triggers the Triton JIT
+                out = triton_forward(*inputs, *params)   # first call triggers the Triton JIT
             produced_output = True
             if tuple(ref.shape) != tuple(out.shape):
                 correct = False
@@ -124,7 +211,7 @@ _RUNNER = textwrap.dedent(
                 break
     except Exception as e:
         correct = False
-        result["error"] = f"{type(e).__name__}: {e}"
+        _record_error(e)
 
     result["compiled"] = produced_output
     result["correct"] = correct
@@ -137,7 +224,7 @@ _RUNNER = textwrap.dedent(
                     return model(*inputs)
             def kernel_fn():
                 with torch.no_grad():
-                    return triton_forward(*inputs)
+                    return triton_forward(*inputs, *params)
             ref_ms = float(
                 triton.testing.do_bench(ref_fn, warmup=25, rep=100, return_mode="median")
             )
@@ -156,6 +243,31 @@ _RUNNER = textwrap.dedent(
 )
 
 
+_MAX_REPORT_ERROR_CHARS = 2000
+
+
+def format_verify_report(result: dict[str, Any]) -> str:
+    """Render a `verify_triton` result as the text the model sees in the REPL output."""
+    lines = [
+        "[verifier] triton_forward vs reference module",
+        f"  compiled: {bool(result.get('compiled'))}",
+        f"  correct: {bool(result.get('correct'))}",
+    ]
+    if result.get("max_diff") is not None:
+        lines.append(f"  max_abs_diff: {float(result['max_diff']):.3e}")
+    if result.get("speedup") is not None:
+        lines.append(
+            f"  speedup: {float(result['speedup']):.2f}x "
+            f"(reference {float(result['ref_ms']):.4f} ms, kernel {float(result['kernel_ms']):.4f} ms)"
+        )
+    error = str(result.get("error") or "")
+    if error:
+        if len(error) > _MAX_REPORT_ERROR_CHARS:
+            error = error[:_MAX_REPORT_ERROR_CHARS] + "..."
+        lines.append(f"  error: {error}")
+    return "\n".join(lines)
+
+
 def verify_triton(
     reference_code: str,
     submission_code: str,
@@ -170,13 +282,22 @@ def verify_triton(
     """Compile, run, and (if correct) time `submission_code` in a subprocess.
 
     Returns {"compiled", "correct", "max_diff", "speedup", "ref_ms", "kernel_ms",
-    "error", "trials", "device"}.
+    "error", "error_chain", "trials", "device", "binding"}; `error_chain` lists the
+    `__cause__`/`__context__` exceptions behind `error`, outermost first.
     """
     python = python or os.environ.get("RLM_VERIFY_PYTHON") or sys.executable
-    _fail = lambda msg: {   # noqa: E731
-        "compiled": False, "correct": False, "max_diff": None,
-        "speedup": None, "ref_ms": None, "kernel_ms": None,
-        "error": msg, "trials": n_trials, "device": "?",
+    _fail = lambda msg: {  # noqa: E731
+        "compiled": False,
+        "correct": False,
+        "max_diff": None,
+        "speedup": None,
+        "ref_ms": None,
+        "kernel_ms": None,
+        "error": msg,
+        "error_chain": [],
+        "trials": n_trials,
+        "device": "?",
+        "binding": None,
     }
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
@@ -187,9 +308,13 @@ def verify_triton(
         sub_path.write_text(submission_code, encoding="utf-8")
         runner_path.write_text(_RUNNER, encoding="utf-8")
         cmd = [
-            python, str(runner_path),
-            str(ref_path), str(sub_path),
-            str(int(n_trials)), repr(float(atol)), repr(float(rtol)),
+            python,
+            str(runner_path),
+            str(ref_path),
+            str(sub_path),
+            str(int(n_trials)),
+            repr(float(atol)),
+            repr(float(rtol)),
         ]
         try:
             proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s, cwd=cwd)

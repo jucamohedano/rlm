@@ -1,14 +1,14 @@
 """Triton kernel generation, trained through the RLM multi-turn harness.
 
-Read this file top to bottom. It contains three functions and nothing else. The
-turn loop, the ```repl``` parsing, the subprocess REPL and the sub-LLM proxy all
-come from `rlm_train` -- you are only writing the task and the reward.
+The turn loop, the ```repl``` parsing, the subprocess REPL and the sub-LLM proxy
+all come from `rlm_train`; this module adds the task prompt, the in-REPL
+verifier (see `triton_rlm.repl`) and the reward.
 
 Reference to keep open while you write this:
     rlm/training/environments/oolong/oolong/env.py     (same shape, 186 lines)
 
 Manifest contract (one JSON object per line, produced by
-`scripts/curriculum_from_ops6k.py`):
+`scripts/curriculum_from_ops6k.py` or `scripts/ppbhatt_parse.py`):
     {"_task_id": str, "_n_ops": int, "ops": str, "data_source": str, "code": str}
 
 Row contract (what `_build_dataset` must return):
@@ -21,21 +21,34 @@ Row contract (what `_build_dataset` must return):
 from __future__ import annotations
 
 import asyncio
-import os
 import json
+import os
 from typing import Any
 
+import rlm_train
 from datasets import Dataset
 
-import rlm_train
+from triton_rlm.repl import VerifyingReplBackend
 from triton_rlm.verifier import verify_triton
 
 _TASK_INSTRUCTION = (
-    "The context contains the PyTorch reference module that defines the task. "
-    "Read it, then write a correct and fast Triton kernel that computes the same "
-    "function. Your submission must be Python source that defines "
+    "The PyTorch reference module below defines the task (it is also the REPL "
+    "`context` variable). Write a correct and fast Triton kernel that computes the "
+    "same function. Your submission must be Python source that defines "
     "`def triton_forward(*tensors) -> torch.Tensor` and returns the result. "
+    "`tensors` are the module's forward inputs (`get_inputs()`), followed by the "
+    "module's parameters in `module.parameters()` order if it has any; they must "
+    "fill exactly the required positional arguments of `triton_forward` (any "
+    "`get_init_inputs()` hyper-parameters go in keyword arguments with defaults). "
     "Include any imports your source needs.\n\n"
+    "Verification happens in the REPL: whenever a ```repl``` block defines "
+    "`triton_forward` and runs without raising, the harness compiles and checks "
+    "that block's source, on its own, against the reference (so the block must be "
+    "self-contained: imports, kernels and `triton_forward` in one block) and "
+    "appends a `[verifier]` report to the output. The verified source is stored in "
+    "the REPL variable `kernel_src`. Once the report says `correct: True`, submit "
+    "with exactly:\n"
+    '```repl\nanswer["content"] = kernel_src\nanswer["ready"] = True\n```\n\n'
     "Example PyTorch reference:\n"
     "```\nimport torch\nclass Model(torch.nn.Module):\n"
     "    def forward(self, x):\n        return torch.relu(x)\n```\n\n"
@@ -49,9 +62,19 @@ _TASK_INSTRUCTION = (
     "    relu_kernel[(triton.cdiv(x.numel(), BLOCK),)](x, out, x.numel(), BLOCK=BLOCK)\n"
     "    return out\n```\n"
     "Do not just call the PyTorch reference from `triton_forward`: that is not a "
-    "Triton kernel and will be scored as non-compiled.\n\n"
-    "Submit the source code as your final answer."
+    "Triton kernel and will be scored as non-compiled."
 )
+
+
+def build_root_prompt(task_id: str, ops: str, code: str) -> str:
+    # The reference module goes in the visible prompt, not only in the REPL
+    # `context`: it is short (KernelBook modules are ~1-2k chars) and the model
+    # needs it in the window to write the kernel at all.
+    return (
+        f"{_TASK_INSTRUCTION}\n\n"
+        f"Task {task_id}.\nOperators: {ops}.\n\n"
+        f"PyTorch reference module:\n```python\n{code}\n```"
+    )
 
 
 def _build_dataset(*, manifest_path: str, max_tasks: int | None = None, **kwargs: Any) -> Dataset:
@@ -63,31 +86,28 @@ def _build_dataset(*, manifest_path: str, max_tasks: int | None = None, **kwargs
       * prompt      -> placeholder; the RLM harness builds the real messages
       * answer      -> leave ""; the scorer does the real work
       * info        -> a JSON STRING (verifiers parses it back into a dict) with:
-            "context"       -> the PyTorch reference code (goes to the REPL, not the window)
-            "root_prompt"   -> a short instruction in the model's visible messages
+            "context"       -> the PyTorch reference code (REPL `context`, also verified against)
+            "root_prompt"   -> the instruction plus the reference, in the visible messages
             "ops"           -> the operator list, handy for the scorer later
 
     `max_tasks` caps the number of rows (use it while developing; None = all).
     """
     rows = {"example_id": [], "prompt": [], "answer": [], "info": []}
-    with open(manifest_path, "r", encoding="utf-8") as f:
+    with open(manifest_path, encoding="utf-8") as f:
         for i, line in enumerate(f):
             if max_tasks is not None and i >= max_tasks:
                 break
             ex = json.loads(line)
             task_id = ex.get("_task_id", str(i))
-            root_prompt = (
-                f"{_TASK_INSTRUCTION}\n\n"
-                f"Task {task_id}.\nOperators: {ex.get('ops', '')}."
-            )
+            root_prompt = build_root_prompt(task_id, ex.get("ops", ""), ex["code"])
             rows["example_id"].append(task_id)
             rows["prompt"].append([{"role": "user", "content": "<placeholder>"}])
             rows["answer"].append("")
             rows["info"].append(
                 json.dumps(
                     {
-                        "context": ex["code"],          # reference -> REPL only
-                        "root_prompt": root_prompt,     # instruction -> visible window
+                        "context": ex["code"],
+                        "root_prompt": root_prompt,
                         "ops": ex.get("ops", ""),
                     }
                 )
@@ -95,8 +115,8 @@ def _build_dataset(*, manifest_path: str, max_tasks: int | None = None, **kwargs
     return Dataset.from_dict(rows)
 
 
-async def score(info: Any, state: Any, **_kw: Any) -> float:
-    """Terminal reward for one rollout, in [0, 1] -- milestone form.
+def milestone_reward(result: dict[str, Any]) -> float:
+    """Reward for a non-empty submission with verifier `result`, in [0, 1].
 
         reward = 0.10 * [submitted]
                + 0.20 * [compiled / produced an output]
@@ -108,17 +128,7 @@ async def score(info: Any, state: Any, **_kw: Any) -> float:
     See notes/reward-design.md for why correctness dominates and why speedup is
     capped.
     """
-    meta = json.loads(info) if isinstance(info, str) else (info or {})
-    submitted = (state.get("rlm_final_answer") or state.get("final_answer") or "").strip()
-    if not submitted:
-        return 0.0
-    reference = str(meta.get("context") or "")
-    # blocking subprocess work must not block the asyncio event loop
-    result = await asyncio.to_thread(verify_triton, reference, submitted)
-
-    reward = 0.0
-    if submitted:
-        reward += 0.10
+    reward = 0.10
     if result.get("compiled"):
         reward += 0.20
     if result.get("correct"):
@@ -126,6 +136,19 @@ async def score(info: Any, state: Any, **_kw: Any) -> float:
         speedup = result.get("speedup")
         if speedup is not None:
             reward += 0.30 * min(max(speedup, 0.0), 3.0) / 3.0
+    return reward
+
+
+async def score(info: Any, state: Any, **_kw: Any) -> float:
+    """Terminal reward for one rollout: `milestone_reward` of the submission, 0 if none."""
+    meta = json.loads(info) if isinstance(info, str) else (info or {})
+    submitted = (state.get("rlm_final_answer") or state.get("final_answer") or "").strip()
+    if not submitted:
+        return 0.0
+    reference = str(meta.get("context") or "")
+    # blocking subprocess work must not block the asyncio event loop
+    result = await asyncio.to_thread(verify_triton, reference, submitted)
+    reward = milestone_reward(result)
 
     # persist the verification outcome so per-rollout metrics/logging can see it
     state["triton_verify"] = {
@@ -143,7 +166,9 @@ async def score(info: Any, state: Any, **_kw: Any) -> float:
     trace_dir = os.environ.get("TRITON_TRACE_DIR")
     if trace_dir:
         try:
-            import pathlib, uuid as _uuid
+            import pathlib
+            import uuid as _uuid
+
             out = pathlib.Path(trace_dir)
             out.mkdir(parents=True, exist_ok=True)
             rid = state.get("rlm_rollout_id") or state.get("trajectory_id") or _uuid.uuid4().hex
@@ -155,7 +180,12 @@ async def score(info: Any, state: Any, **_kw: Any) -> float:
                 "submission": submitted[:20000],
                 "metrics": {
                     k: state.get(k)
-                    for k in ("rlm_iterations", "rlm_repl_calls", "rlm_sub_llm_calls", "rlm_has_final_answer")
+                    for k in (
+                        "rlm_iterations",
+                        "rlm_repl_calls",
+                        "rlm_sub_llm_calls",
+                        "rlm_has_final_answer",
+                    )
                 },
                 "completion": state.get("completion"),
             }
@@ -168,16 +198,27 @@ async def score(info: Any, state: Any, **_kw: Any) -> float:
 async def verify_compiled(state: Any) -> int:
     return 1 if (state.get("triton_verify") or {}).get("compiled") else 0
 
+
 async def verify_correct(state: Any) -> int:
     return 1 if (state.get("triton_verify") or {}).get("correct") else 0
+
 
 async def verify_speedup(state: Any) -> float:
     v = (state.get("triton_verify") or {}).get("speedup")
     return round(float(v), 3) if v is not None else 0.0
 
+
 async def verify_max_diff(state: Any) -> float:
     v = (state.get("triton_verify") or {}).get("max_diff")
     return round(float(v), 6) if v is not None else -1.0
+
+
+class TritonRLMEnv(rlm_train.RLMTrainEnv):
+    """RLMTrainEnv whose REPL verifies `triton_forward` blocks against the task's reference."""
+
+    async def setup_state(self, state: Any) -> None:
+        await super().setup_state(state)
+        state["rlm_backend"] = VerifyingReplBackend(state["rlm_backend"], state["info"]["context"])
 
 
 def load_environment(*, manifest_path: str, max_iterations: int = 8, **kwargs: Any) -> Any:
@@ -186,7 +227,7 @@ def load_environment(*, manifest_path: str, max_iterations: int = 8, **kwargs: A
     Shape (see oolong/env.py::load_environment):
 
         dataset = _build_dataset(manifest_path=manifest_path, **kwargs)
-        return rlm_train.RLMTrainEnv(
+        return TritonRLMEnv(
             dataset=dataset,
             max_iterations=max_iterations,
             rubric=rlm_train.RLMTrainRubric(correctness=score, weight=1.0),
@@ -207,7 +248,7 @@ def load_environment(*, manifest_path: str, max_iterations: int = 8, **kwargs: A
     rubric.add_metric(verify_correct)
     rubric.add_metric(verify_speedup)
     rubric.add_metric(verify_max_diff)
-    return rlm_train.RLMTrainEnv(
+    return TritonRLMEnv(
         dataset=dataset,
         max_iterations=max_iterations,
         rubric=rubric,

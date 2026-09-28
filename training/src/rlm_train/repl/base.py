@@ -9,6 +9,9 @@ from typing import Any
 class ExecResult:
     stdout: str = ""
     stderr: str = ""
+    # "ExcType: message" when the block raised, else None. `stderr` also carries
+    # the traceback but may hold output the block itself wrote to stderr.
+    exception: str | None = None
     final_answer: str | None = None
     execution_time: float = 0.0
     locals_keys: list[str] = field(default_factory=list)
@@ -23,6 +26,9 @@ class ReplBackend(ABC):
 
     @abstractmethod
     async def execute(self, code: str) -> ExecResult: ...
+
+    @abstractmethod
+    async def set_local(self, name: str, value: Any) -> None: ...
 
     @abstractmethod
     async def stop(self) -> None: ...
