@@ -175,3 +175,80 @@ def test_load_actions_strips_fence_and_rejects_duplicates(regen, tmp_path: Path)
     )
     with pytest.raises(ValueError, match="duplicate"):
         regen.load_actions(tmp_path, 0)
+
+
+def _traj(key: str, split: str, repair: bool, provenance: str = "teacher") -> dict[str, Any]:
+    return {
+        "example_id": key,
+        "messages": [],
+        "triton_rlm": {"split": split, "repair": repair, "provenance": provenance},
+    }
+
+
+def _rows(key: str, n: int) -> list[dict[str, Any]]:
+    return [{"example_id": key, "turn": i, "messages": []} for i in range(1, n + 1)]
+
+
+def test_collect_excludes_original_repairs_and_caps_regenerated(regen, tmp_path: Path) -> None:
+    reexec = tmp_path / "reexec"
+    rd = tmp_path / "regen" / "round0"
+    reexec.mkdir()
+    rd.mkdir(parents=True)
+    originals = [_traj("a", "train", False), _traj("b", "train", False), _traj("c", "train", False)]
+    originals.append(_traj("r", "train", True))
+    regen.write_jsonl(reexec / "sft_trajectories.train.jsonl", originals)
+    regen.write_jsonl(
+        reexec / "sft_rows.train.jsonl",
+        [*_rows("a", 2), *_rows("b", 2), *_rows("c", 2), *_rows("r", 3)],
+    )
+    regen.write_jsonl(reexec / "sft_trajectories.val.jsonl", [_traj("v", "val", True)])
+    regen.write_jsonl(reexec / "sft_rows.val.jsonl", _rows("v", 3))
+    finished = [_traj(k, "train", True, "regenerated") for k in ("r1", "r2", "r3")]
+    finished.append(_traj("v", "val", True, "regenerated"))
+    regen.write_jsonl(rd / "sft_trajectories.regen.jsonl", finished)
+    regen.write_jsonl(
+        rd / "sft_rows.regen.jsonl",
+        [*_rows("r1", 3), *_rows("r2", 3), *_rows("r3", 3), *_rows("v", 3)],
+    )
+
+    ns = type("NS", (), {})()
+    ns.reexec_dir, ns.regen_dir, ns.max_share, ns.seed = (
+        str(reexec),
+        str(tmp_path / "regen"),
+        0.3,
+        0,
+    )
+    ns.exclude_original_repairs = True
+    regen.collect(ns)
+    summary = json.loads((tmp_path / "regen" / "mix" / "summary.json").read_text())
+    assert summary["original_trajectories_total"] == 5
+    assert summary["original_repairs_excluded"] == 2
+    assert summary["regenerated_not_train_split_excluded"] == 1
+    # int(0.3 * 3 / 0.7) == 1 regenerated trajectory fits under the cap next to 3 originals
+    assert summary["regenerated_kept_after_cap"] == 1
+    assert summary["per_split"]["train"] == {
+        "original_trajectories": 3,
+        "regenerated_trajectories": 1,
+        "regenerated_share": 0.25,
+        "rows": 9,
+    }
+    assert summary["per_split"]["val"] == {
+        "original_trajectories": 0,
+        "regenerated_trajectories": 0,
+        "regenerated_share": 0.0,
+        "rows": 0,
+    }
+    train = regen.load_jsonl(tmp_path / "regen" / "mix" / "sft_trajectories.train.jsonl")
+    assert sorted(t["triton_rlm"]["provenance"] for t in train) == [
+        "regenerated",
+        "teacher",
+        "teacher",
+        "teacher",
+    ]
+
+    ns.exclude_original_repairs = False
+    regen.collect(ns)
+    summary = json.loads((tmp_path / "regen" / "mix" / "summary.json").read_text())
+    assert summary["original_repairs_excluded"] == 0
+    assert summary["per_split"]["train"]["original_trajectories"] == 4
+    assert summary["per_split"]["val"]["original_trajectories"] == 1

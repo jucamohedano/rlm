@@ -15,15 +15,17 @@ mix. It never calls a model.
         -> regen_dir/round0/{tasks.jsonl, shard*.jsonl, SESSION_PROMPT.md}
            prints N tasks and the token totals, so the cost is known before anything runs.
     execute  (GPU)  parsed/traces.jsonl regen_dir --round r
-        reads round<r>/tasks.jsonl + round<r>/actions*.jsonl ({sample_key, round, code}),
-        replays each task's prefix in a fresh worker (persistent namespace, as in a
-        rollout), runs the regenerated block, verifies it, applies `trace_regen.judge`
+        reads round<r>/tasks.jsonl + every round<r>/actions*.jsonl ({sample_key, round,
+        code}) in one process (all shards, one container), replays each task's prefix in
+        a fresh worker (persistent namespace, as in a rollout), runs the regenerated block, verifies it, applies `trace_regen.judge`
         -> round<r>/results.jsonl, round<r>/sft_{rows,trajectories}.regen.jsonl (finished),
            round<r+1>/{tasks.jsonl, shard*.jsonl, SESSION_PROMPT.md} (continued).
     collect  (CPU)  reexec_dir regen_dir [--max-share 0.3] [--seed 0]
+                    [--exclude-original-repairs]
         -> regen_dir/mix/sft_{rows,trajectories}.<split>.jsonl + summary.json: the
-           original trajectories plus a seeded uniform sample of the regenerated ones
-           capped at --max-share of train; val stays original-only.
+           original trajectories (first-shot successes only with
+           --exclude-original-repairs) plus a seeded uniform sample of the regenerated
+           ones capped at --max-share of train; val stays original-only.
 
 A task is one trace: `prefix` = the turns kept from the source (all failed under our
 verifier, the last one being the turn whose feedback the regenerated block answers),
@@ -510,6 +512,13 @@ def collect(args: argparse.Namespace) -> None:
     original = {
         p.name.split(".")[1]: load_jsonl(p) for p in sorted(reexec.glob("sft_trajectories.*.jsonl"))
     }
+    n_original_all = sum(len(v) for v in original.values())
+    if args.exclude_original_repairs:
+        original = {
+            split: [t for t in trajs if not t["triton_rlm"]["repair"]]
+            for split, trajs in original.items()
+        }
+    original_keys = {t["example_id"] for trajs in original.values() for t in trajs}
     finished = [
         t
         for rd in sorted(regen.glob("round*"))
@@ -526,6 +535,8 @@ def collect(args: argparse.Namespace) -> None:
     kept_regen = [t for t in train_regen if t["example_id"] in kept_keys]
     mix = regen / "mix"
     summary: dict[str, Any] = {
+        "original_trajectories_total": n_original_all,
+        "original_repairs_excluded": n_original_all - len(original_keys),
         "regenerated_finished": len(finished),
         "regenerated_not_train_split_excluded": len(finished) - len(train_regen),
         "regenerated_kept_after_cap": len(kept_regen),
@@ -535,7 +546,11 @@ def collect(args: argparse.Namespace) -> None:
     for split, trajs in original.items():
         extra = kept_regen if split == "train" else []
         out_trajs = [*trajs, *extra]
-        rows = load_jsonl(reexec / f"sft_rows.{split}.jsonl")
+        rows = [
+            r
+            for r in load_jsonl(reexec / f"sft_rows.{split}.jsonl")
+            if r["example_id"] in original_keys
+        ]
         regen_keys = {t["example_id"] for t in extra}
         rows += [
             r
@@ -599,6 +614,11 @@ def main() -> None:
     c.add_argument("regen_dir")
     c.add_argument("--max-share", type=float, default=0.3)
     c.add_argument("--seed", type=int, default=0)
+    c.add_argument(
+        "--exclude-original-repairs",
+        action="store_true",
+        help="keep only first-shot originals; teacher repairs enter the mix only if regenerated",
+    )
     c.set_defaults(fn=collect)
 
     args = ap.parse_args()
