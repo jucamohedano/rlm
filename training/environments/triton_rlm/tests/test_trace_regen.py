@@ -1,9 +1,13 @@
 import pytest
 from triton_rlm.trace_regen import (
     cap_regenerated,
+    feedback_status,
     judge,
+    message_deviations,
+    prompt_deviation,
     regen_start,
     strip_fence,
+    without_repl_vars,
 )
 from triton_rlm.trace_translate import TurnClass
 
@@ -108,3 +112,84 @@ def test_cap_regenerated_is_uniform_and_seeded() -> None:
     assert cap_regenerated(keys[:10], 70, 0.3, 0) == sorted(keys[:10])
     with pytest.raises(ValueError):
         cap_regenerated(keys, 70, 1.0, 0)
+
+
+TB = (
+    "REPL output:\n\nTraceback (most recent call last):\n"
+    '  File "<repl-ppbhatt_kernelbook_7-1>", line 4, in <module>\n'
+    "TypeError: 'tuple' object cannot be interpreted as an integer\n"
+)
+VARS = "\n\nREPL variables: ['answer', 'context']\n"
+REPORT = (
+    "REPL output:\n\n[verifier] compiled: True  correct: False\n"
+    "error: max_abs_diff 4.018e-02 > 1.0e-02 (ref 0.031ms)\n"
+)
+
+
+def test_without_repl_vars_matches_render_without_locals_keys() -> None:
+    assert without_repl_vars(TB + VARS) == TB
+    assert (
+        without_repl_vars("REPL output:\nREPL variables: ['answer']\n") == "REPL output:\nNo output"
+    )
+    assert without_repl_vars(TB) == TB
+
+
+def test_message_deviations_names_each_cosmetic_kind() -> None:
+    regen_tb = TB.replace("<repl-ppbhatt_kernelbook_7-1>", "<repl-ppbhatt_regen_kernelbook_7_0-1>")
+    assert message_deviations(TB, TB) == []
+    assert message_deviations(TB, TB + VARS) == ["missing_repl_variables_line"]
+    assert message_deviations(TB, regen_tb) == ["repl_filename"]
+    assert message_deviations(TB, regen_tb + VARS) == [
+        "missing_repl_variables_line",
+        "repl_filename",
+    ]
+    drifted = REPORT.replace("4.018e-02", "3.754e-02").replace("0.031ms", "0.029ms")
+    assert message_deviations(REPORT, drifted) == ["float_values"]
+    # a different class or message is never cosmetic
+    assert message_deviations(TB, TB.replace("TypeError", "ValueError")) == ["other"]
+    assert message_deviations(REPORT, REPORT.replace("correct: False", "correct: True")) == [
+        "other"
+    ]
+    assert message_deviations(TB, TB.replace("line 4", "line 5")) == ["other"]
+
+
+def test_prompt_deviation_only_forgives_repl_output_messages() -> None:
+    shown = [
+        {"role": "system", "content": "sys"},
+        {"role": "assistant", "content": "```repl\nx\n```"},
+        {"role": "user", "content": TB},
+        {"role": "user", "content": "Turn 2/8:"},
+    ]
+    rendered = [*shown[:2], {"role": "user", "content": TB + VARS}, shown[3]]
+    assert prompt_deviation(shown, shown) == ([], None)
+    assert prompt_deviation(shown, rendered) == (["missing_repl_variables_line"], 2)
+    other = [*shown[:3], {"role": "user", "content": "Turn 3/8:"}]
+    assert prompt_deviation(shown, other) == (["other"], 3)
+    assert prompt_deviation(shown, shown[:3]) == (["other"], 3)
+
+
+def test_feedback_status_compares_the_answered_output() -> None:
+    shown = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": REPORT},
+        {"role": "user", "content": "Turn 2/8:"},
+    ]
+    exact = [
+        *shown[:1],
+        {"role": "user", "content": REPORT + VARS},
+        shown[2],
+        {"role": "assistant", "content": "fix"},
+    ]
+    assert feedback_status(shown, exact) == ("exact", [])
+    drifted = [
+        *shown[:1],
+        {"role": "user", "content": REPORT.replace("4.018e-02", "3.754e-02")},
+        shown[2],
+    ]
+    assert feedback_status(shown, drifted) == ("cosmetic", ["float_values"])
+    stale = [*shown[:1], {"role": "user", "content": TB}, shown[2]]
+    assert feedback_status(shown, stale) == ("stale", ["other"])
+    assert feedback_status(shown, None) == ("unverifiable", [])
+    assert feedback_status(shown, shown[:2]) == ("unverifiable", [])
+    with pytest.raises(ValueError, match="not a REPL output"):
+        feedback_status([shown[0], shown[2]], exact)

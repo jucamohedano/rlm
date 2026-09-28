@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from triton_rlm.trace_translate import SUBMIT_IDIOM, ParsedTrace
+from triton_rlm.trace_translate import SUBMIT_IDIOM, ParsedTrace, ParsedTurn, TurnClass
 from triton_rlm.verifier import format_verify_report
 
 from rlm_train.repl.base import ExecResult
@@ -186,7 +186,29 @@ def _traj(key: str, split: str, repair: bool, provenance: str = "teacher") -> di
 
 
 def _rows(key: str, n: int) -> list[dict[str, Any]]:
-    return [{"example_id": key, "turn": i, "messages": []} for i in range(1, n + 1)]
+    return [
+        {"example_id": key, "turn": i, "messages": [], "triton_rlm": {"provenance": "x"}}
+        for i in range(1, n + 1)
+    ]
+
+
+def _audit(
+    key: str,
+    deviation: list[str] | None,
+    feedback: str = "exact",
+    feedback_deviation: list[str] | None = None,
+) -> dict[str, Any]:
+    return {
+        "sample_key": key,
+        "prompt_deviation": deviation,
+        "feedback": feedback,
+        "feedback_deviation": feedback_deviation or [],
+        "disqualified": feedback == "stale" or (deviation is not None and "other" in deviation),
+    }
+
+
+def _result(key: str, action: str, reason: str) -> dict[str, Any]:
+    return {"sample_key": key, "round": 0, "action": action, "reason": reason}
 
 
 def test_collect_excludes_original_repairs_and_caps_regenerated(regen, tmp_path: Path) -> None:
@@ -203,12 +225,21 @@ def test_collect_excludes_original_repairs_and_caps_regenerated(regen, tmp_path:
     )
     regen.write_jsonl(reexec / "sft_trajectories.val.jsonl", [_traj("v", "val", True)])
     regen.write_jsonl(reexec / "sft_rows.val.jsonl", _rows("v", 3))
-    finished = [_traj(k, "train", True, "regenerated") for k in ("r1", "r2", "r3")]
-    finished.append(_traj("v", "val", True, "regenerated"))
+    finished_keys = ("r", "r1", "r2", "r3", "tr", "st", "v")
+    finished = [
+        _traj(k, "val" if k == "v" else "train", True, "regenerated") for k in finished_keys
+    ]
     regen.write_jsonl(rd / "sft_trajectories.regen.jsonl", finished)
     regen.write_jsonl(
-        rd / "sft_rows.regen.jsonl",
-        [*_rows("r1", 3), *_rows("r2", 3), *_rows("r3", 3), *_rows("v", 3)],
+        rd / "sft_rows.regen.jsonl", [row for k in finished_keys for row in _rows(k, 3)]
+    )
+    regen.write_jsonl(
+        rd / "results.jsonl",
+        [
+            *(_result(k, "finish", "correct_fast") for k in finished_keys),
+            _result("rw", "drop", "rewrite, not repair: 20 changed lines > 12"),
+            _result("co", "continue", "new failure incorrect"),
+        ],
     )
 
     ns = type("NS", (), {})()
@@ -219,13 +250,48 @@ def test_collect_excludes_original_repairs_and_caps_regenerated(regen, tmp_path:
         0,
     )
     ns.exclude_original_repairs = True
+    ns.truncated = ["tr"]
+    with pytest.raises(SystemExit, match="audit"):
+        regen.collect(ns)
+    regen.write_jsonl(
+        rd / "audit.jsonl",
+        [
+            _audit("r", []),
+            _audit("r1", ["missing_repl_variables_line"]),
+            _audit("r2", ["missing_repl_variables_line"], "cosmetic", ["float_values"]),
+            _audit("r3", ["missing_repl_variables_line"], "cosmetic", ["repl_filename"]),
+            _audit("tr", ["missing_repl_variables_line"]),
+            _audit("v", ["missing_repl_variables_line"]),
+            _audit("st", [], "stale"),
+            _audit("rw", []),
+            _audit("co", []),
+        ],
+    )
     regen.collect(ns)
     summary = json.loads((tmp_path / "regen" / "mix" / "summary.json").read_text())
     assert summary["original_trajectories_total"] == 5
     assert summary["original_repairs_excluded"] == 2
-    assert summary["regenerated_not_train_split_excluded"] == 1
+    assert summary["regenerated_tasks"] == 9
+    assert summary["regenerated_finished"] == 7
     # int(0.3 * 3 / 0.7) == 1 regenerated trajectory fits under the cap next to 3 originals
     assert summary["regenerated_kept_after_cap"] == 1
+    excluded = summary["excluded"]
+    assert excluded["tr"] == "truncated_history"
+    assert excluded["st"].startswith("audit_disqualified: feedback stale")
+    assert excluded["rw"] == "no_clean_repair: rewrite, not repair: 20 changed lines > 12"
+    assert excluded["co"] == "no_clean_repair: continue, round 1 not run"
+    assert excluded["v"].startswith("regenerated_val_split")
+    assert "a" not in excluded
+    resampled = [k for k, why in excluded.items() if why.startswith("resampled_out")]
+    assert len(resampled) == 3 and set(resampled) < {"r", "r1", "r2", "r3"}
+    assert summary["excluded_by_reason"] == {
+        "truncated_history": 1,
+        "audit_disqualified": 1,
+        "no_clean_repair": 2,
+        "regenerated_val_split": 1,
+        "resampled_out": 3,
+    }
+    assert summary["loss_masking"]["sft_rows.<split>.jsonl"].startswith("USE THIS for SFT")
     assert summary["per_split"]["train"] == {
         "original_trajectories": 3,
         "regenerated_trajectories": 1,
@@ -245,6 +311,37 @@ def test_collect_excludes_original_repairs_and_caps_regenerated(regen, tmp_path:
         "teacher",
         "teacher",
     ]
+    [kept] = [t for t in train if t["triton_rlm"]["provenance"] == "regenerated"]
+    key = kept["example_id"]
+    assert key not in excluded
+    expected_prompt = {"r": [], "r1": ["missing_repl_variables_line"]}
+    expected_prompt |= dict.fromkeys(("r2", "r3"), ["missing_repl_variables_line"])
+    expected_feedback = {"r": [], "r1": [], "r2": ["float_values"], "r3": ["repl_filename"]}
+    assert kept["triton_rlm"]["prompt_deviation"] == expected_prompt[key]
+    assert kept["triton_rlm"]["feedback_deviation"] == expected_feedback[key]
+    assert summary["regenerated_kept_prompt_deviation"] == {
+        regen.deviation_label(expected_prompt[key]): 1
+    }
+    assert summary["regenerated_kept_feedback_deviation"] == dict.fromkeys(
+        expected_feedback[key], 1
+    )
+    rows = regen.load_jsonl(tmp_path / "regen" / "mix" / "sft_rows.train.jsonl")
+    regen_rows = [r for r in rows if r["example_id"] == key]
+    assert len(regen_rows) == 3
+    assert all(r["triton_rlm"]["prompt_deviation"] == expected_prompt[key] for r in regen_rows)
+    assert all(r["triton_rlm"]["feedback_deviation"] == expected_feedback[key] for r in regen_rows)
+
+    ns.max_share = 0.6  # int(0.6 * 3 / 0.4) == 4: every eligible regeneration fits
+    regen.collect(ns)
+    summary = json.loads((tmp_path / "regen" / "mix" / "summary.json").read_text())
+    assert summary["regenerated_kept_after_cap"] == 4
+    assert "resampled_out" not in summary["excluded_by_reason"]
+    assert summary["regenerated_kept_prompt_deviation"] == {
+        "exact": 1,
+        "missing_repl_variables_line": 3,
+    }
+    assert summary["regenerated_kept_feedback_deviation"] == {"float_values": 1, "repl_filename": 1}
+    assert summary["per_split"]["train"]["regenerated_share"] == 4 / 7
 
     ns.exclude_original_repairs = False
     regen.collect(ns)
@@ -252,3 +349,62 @@ def test_collect_excludes_original_repairs_and_caps_regenerated(regen, tmp_path:
     assert summary["original_repairs_excluded"] == 0
     assert summary["per_split"]["train"]["original_trajectories"] == 4
     assert summary["per_split"]["val"]["original_trajectories"] == 1
+    assert summary["excluded"]["r"].startswith("original_kept")
+    assert summary["excluded"]["v"].startswith("original_kept")
+    assert summary["regenerated_kept_after_cap"] == 3
+
+
+def test_prepare_recovers_locals_keys_from_emitted_rows_or_aborts(regen, tmp_path: Path) -> None:
+    t = trace()
+    t.turns.append(ParsedTurn(1, FIXED, TurnClass("correct")))
+    traces = tmp_path / "traces.jsonl"
+    traces.write_text(json.dumps(t.to_json()) + "\n")
+    reexec = tmp_path / "reexec"
+    regen.write_jsonl(
+        reexec / "trace_summary.jsonl",
+        [
+            {
+                "sample_key": t.sample_key,
+                "kept": True,
+                "first_correct_turn": 1,
+                "our_classes": ["error[TypeError]", "correct_fast"],
+                "truncated_at": None,
+                "drop_reason": None,
+            }
+        ],
+    )
+    failed_log = {
+        "index": 0,
+        "stdout": format_verify_report(TYPE_ERR) + "\n",
+        "stderr": "",
+        "exception": None,
+    }
+    regen.write_jsonl(
+        reexec / "exec_log.jsonl", [{"sample_key": t.sample_key, "turn_logs": [failed_log]}]
+    )
+    ns = type("NS", (), {})()
+    ns.traces, ns.reexec_dir, ns.regen_dir = str(traces), str(reexec), str(tmp_path / "regen")
+    ns.review_flags, ns.flags, ns.repairs, ns.dropped, ns.only, ns.shards = (
+        None,
+        [],
+        True,
+        False,
+        [],
+        1,
+    )
+    ns.max_changed_lines, ns.max_regen_turns, ns.max_iterations, ns.min_head_ratio = 12, 3, 8, 0.6
+    with pytest.raises(SystemExit, match="no locals_keys"):
+        regen.prepare(ns)
+
+    keys = ["answer", "context", "kernel_src"]
+    exact = regen.render_prefix(
+        t, [(FAILED, ExecResult(stdout=failed_log["stdout"], locals_keys=keys))], 8
+    )
+    regen.write_jsonl(
+        reexec / "sft_trajectories.train.jsonl",
+        [{"example_id": t.sample_key, "messages": [*exact, {"role": "assistant", "content": "x"}]}],
+    )
+    regen.prepare(ns)
+    [task_row] = regen.load_jsonl(tmp_path / "regen" / "round0" / "tasks.jsonl")
+    assert task_row["messages"] == exact
+    assert "REPL variables: ['answer', 'context', 'kernel_src']" in task_row["last_feedback"]

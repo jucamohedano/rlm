@@ -10,22 +10,39 @@ mix. It never calls a model.
         OUR_LINE_UNTOUCHED) sit on a failed turn before the first correct one; or with
         --repairs every kept repair (its correct turn is regenerated); plus with
         --dropped every dropped trace, from its truncation turn.
-        Round 0 prompts from a log without `locals_keys` (67a4420) lack the
-        `REPL variables:` line; `execute` reports such prompt/emitted render differences.
+        A log without `locals_keys` (67a4420) gets the `REPL variables:` line read back
+        from the emitted trajectory (`ppbhatt_review.recover_locals_keys`); a prefix turn
+        that cannot be rendered exactly aborts.
         -> regen_dir/round0/{tasks.jsonl, shard*.jsonl, SESSION_PROMPT.md}
            prints N tasks and the token totals, so the cost is known before anything runs.
     execute  (GPU)  parsed/traces.jsonl regen_dir --round r
         reads round<r>/tasks.jsonl + every round<r>/actions*.jsonl ({sample_key, round,
         code}) in one process (all shards, one container), replays each task's prefix in
-        a fresh worker (persistent namespace, as in a rollout), runs the regenerated block, verifies it, applies `trace_regen.judge`
+        a fresh worker (persistent namespace, as in a rollout), runs the regenerated block,
+        verifies it, applies `trace_regen.judge`
         -> round<r>/results.jsonl, round<r>/sft_{rows,trajectories}.regen.jsonl (finished),
            round<r+1>/{tasks.jsonl, shard*.jsonl, SESSION_PROMPT.md} (continued).
+    audit    (CPU)  regen_dir --round r
+        per task: what the generator was shown vs what our worker rendered on replay
+        (`trace_regen.prompt_deviation` / `feedback_status`). `prompt_deviation`: the
+        normalisations that make the shown REPL outputs equal to the replayed ones
+        (missing_repl_variables_line, repl_filename, float_values), `[]` if byte-identical,
+        `other` if none suffice, with the first differing message index. `feedback`:
+        exact | cosmetic | stale | unverifiable -- the last REPL output the generator
+        answered vs the replayed one for the same code, i.e. the error class and message
+        it acted on; stale (or `other`, or a prefix class mismatch) disqualifies.
+        -> round<r>/audit.jsonl, read by collect.
     collect  (CPU)  reexec_dir regen_dir [--max-share 0.3] [--seed 0]
-                    [--exclude-original-repairs]
+                    [--exclude-original-repairs] [--truncated KEY ...]
         -> regen_dir/mix/sft_{rows,trajectories}.<split>.jsonl + summary.json: the
            original trajectories (first-shot successes only with
            --exclude-original-repairs) plus a seeded uniform sample of the regenerated
-           ones capped at --max-share of train; val stays original-only.
+           ones capped at --max-share of the combined train set; val stays original-only.
+           Regenerated rows carry `prompt_deviation` / `feedback_deviation` from the
+           audit. `summary.json.excluded` names every regeneration task that is in
+           neither the originals nor the kept regenerations, with its reason
+           (no_clean_repair, truncated_history for --truncated keys, audit_disqualified,
+           regenerated_val_split, resampled_out, original_kept).
 
 A task is one trace: `prefix` = the turns kept from the source (all failed under our
 verifier, the last one being the turn whose feedback the regenerated block answers),
@@ -45,6 +62,7 @@ from pathlib import Path
 from typing import Any
 
 from ppbhatt_reexec import DUMMY_PROXY_URL, check_source_tree, fence
+from ppbhatt_review import recover_locals_keys
 from rlm.utils.parsing import find_code_blocks
 from rlm.utils.prompts import (
     RLM_SYSTEM_PROMPT,
@@ -57,7 +75,9 @@ from triton_rlm.repl import VerifyingReplBackend
 from triton_rlm.trace_regen import (
     approx_tokens,
     cap_regenerated,
+    feedback_status,
     judge,
+    prompt_deviation,
     regen_start,
     strip_fence,
 )
@@ -153,7 +173,7 @@ def log_result(log: dict[str, Any]) -> ExecResult:
         stdout=log["stdout"],
         stderr=log["stderr"],
         exception=log["exception"],
-        locals_keys=log.get("locals_keys", []),
+        locals_keys=log["locals_keys"],
     )
 
 
@@ -226,7 +246,15 @@ def prepare(args: argparse.Namespace) -> None:
     traces = load_traces(Path(args.traces))
     reexec = Path(args.reexec_dir)
     summaries = {s["sample_key"]: s for s in load_jsonl(reexec / "trace_summary.jsonl")}
-    logs = {r["sample_key"]: r["turn_logs"] for r in load_jsonl(reexec / "exec_log.jsonl")}
+    emitted = {
+        t["example_id"]: t["messages"]
+        for p in sorted(reexec.glob("sft_trajectories.*.jsonl"))
+        for t in load_jsonl(p)
+    }
+    logs = {
+        r["sample_key"]: recover_locals_keys(r["turn_logs"], emitted.get(r["sample_key"]))
+        for r in load_jsonl(reexec / "exec_log.jsonl")
+    }
     review = (
         {r["sample_key"]: r for r in load_jsonl(Path(args.review_flags))}
         if args.review_flags
@@ -266,6 +294,11 @@ def prepare(args: argparse.Namespace) -> None:
         for log in turn_logs[: k + 1]:
             code = trace.turns[log["index"]].code
             assert code is not None
+            if "locals_keys" not in log:
+                raise SystemExit(
+                    f"{key} turn {log['index']}: exec_log has no locals_keys and the turn is not "
+                    "in an emitted trajectory; the prompt cannot be rendered exactly"
+                )
             executed.append((code, log_result(log)))
             prefix.append(
                 {
@@ -495,7 +528,7 @@ async def execute_async(args: argparse.Namespace) -> None:
     mismatch = sum(1 for r in results if r.get("prompt_render_mismatch"))
     print(
         f"round {args.round}: {dict(outcome)}; finished {len(trajectories)} trajectories; "
-        f"prompt/emitted prefix render mismatch on {mismatch} tasks"
+        f"prompt/emitted prefix render mismatch on {mismatch} tasks (classify with `audit`)"
     )
     if next_tasks:
         write_round(regen, args.round + 1, next_tasks, args.shards)
@@ -506,9 +539,110 @@ def execute(args: argparse.Namespace) -> None:
     asyncio.run(execute_async(args))
 
 
+def replayed_renders(regen: Path, round_no: int) -> dict[str, list[dict[str, str]]]:
+    """Per task, the history our worker rendered on replay: the finished trajectory's
+    messages, or the continued task's messages in the next round (both are built by
+    `render_prefix` from live `ExecResult`s in `execute_task`)."""
+    rd = regen / f"round{round_no}"
+    renders = {
+        t["example_id"]: t["messages"] for t in load_jsonl(rd / "sft_trajectories.regen.jsonl")
+    }
+    nxt = regen / f"round{round_no + 1}" / "tasks.jsonl"
+    if nxt.exists():
+        renders |= {t["sample_key"]: t["messages"] for t in load_jsonl(nxt)}
+    return renders
+
+
+def audit_task(
+    task: dict[str, Any], result: dict[str, Any], rendered: list[dict[str, str]] | None
+) -> dict[str, Any]:
+    shown: list[dict[str, str]] = task["messages"]
+    replay: list[str] = result.get("prefix_replay", [])
+    classes_match = len(replay) == len(task["prefix"]) and all(
+        class_of(r) == class_of(p["ours"]) for r, p in zip(replay, task["prefix"], strict=True)
+    )
+    if rendered is None:
+        deviation, first = None, None
+    else:
+        deviation, first = prompt_deviation(shown, rendered[: len(shown)])
+    feedback, feedback_kinds = feedback_status(shown, rendered)
+    return {
+        "sample_key": task["sample_key"],
+        "round": task["round"],
+        "action": result["action"],
+        "reason": result["reason"],
+        "replay_classes_match": classes_match,
+        "prompt_deviation": deviation,
+        "first_differing_message": first,
+        "feedback": feedback,
+        "feedback_deviation": feedback_kinds,
+        "disqualified": (
+            feedback == "stale"
+            or (deviation is not None and "other" in deviation)
+            or not classes_match
+        ),
+    }
+
+
+def audit(args: argparse.Namespace) -> None:
+    regen = Path(args.regen_dir)
+    rd = regen / f"round{args.round}"
+    tasks = load_jsonl(rd / "tasks.jsonl")
+    results = {r["sample_key"]: r for r in load_jsonl(rd / "results.jsonl")}
+    renders = replayed_renders(regen, args.round)
+    rows = [audit_task(t, results[t["sample_key"]], renders.get(t["sample_key"])) for t in tasks]
+    write_jsonl(rd / "audit.jsonl", rows)
+    counts = {
+        "tasks": len(rows),
+        "prompt_deviation": dict(
+            collections.Counter(deviation_label(r["prompt_deviation"]) for r in rows)
+        ),
+        "feedback": dict(collections.Counter(r["feedback"] for r in rows)),
+        "feedback_deviation": dict(
+            collections.Counter(k for r in rows for k in r["feedback_deviation"])
+        ),
+        "replay_classes_mismatch": sum(not r["replay_classes_match"] for r in rows),
+        "disqualified": sorted(r["sample_key"] for r in rows if r["disqualified"]),
+    }
+    for r in rows:
+        first = r["first_differing_message"]
+        print(
+            f"{r['sample_key']:18s} {r['action']:8s} render={deviation_label(r['prompt_deviation'])} "
+            f"feedback={r['feedback']}{r['feedback_deviation'] if r['feedback_deviation'] else ''}"
+            + (f" msg{first}" if first is not None else "")
+            + ("  DISQUALIFIED" if r["disqualified"] else "")
+        )
+    print(json.dumps(counts, indent=2))
+
+
+def deviation_label(kinds: list[str] | None) -> str:
+    """`prompt_deviation` as one counter key: `unverifiable` (no replayed render), `exact`,
+    or the `+`-joined kinds."""
+    if kinds is None:
+        return "unverifiable"
+    return "+".join(kinds) if kinds else "exact"
+
+
+def tag_deviation(row: dict[str, Any], audit_row: dict[str, Any]) -> dict[str, Any]:
+    meta = {
+        **row["triton_rlm"],
+        "prompt_deviation": audit_row["prompt_deviation"],
+        "feedback_deviation": audit_row["feedback_deviation"],
+    }
+    return {**row, "triton_rlm": meta}
+
+
+def load_audit(regen: Path, rd: Path) -> dict[str, dict[str, Any]]:
+    path = rd / "audit.jsonl"
+    if not path.exists():
+        raise SystemExit(f"{path} missing: run `audit {regen} --round {rd.name[5:]}` first")
+    return {r["sample_key"]: r for r in load_jsonl(path)}
+
+
 def collect(args: argparse.Namespace) -> None:
     reexec = Path(args.reexec_dir)
     regen = Path(args.regen_dir)
+    truncated = set(args.truncated)
     original = {
         p.name.split(".")[1]: load_jsonl(p) for p in sorted(reexec.glob("sft_trajectories.*.jsonl"))
     }
@@ -519,28 +653,80 @@ def collect(args: argparse.Namespace) -> None:
             for split, trajs in original.items()
         }
     original_keys = {t["example_id"] for trajs in original.values() for t in trajs}
-    finished = [
-        t
-        for rd in sorted(regen.glob("round*"))
-        if (rd / "sft_trajectories.regen.jsonl").exists()
-        for t in load_jsonl(rd / "sft_trajectories.regen.jsonl")
-    ]
-    train_regen = [t for t in finished if t["triton_rlm"]["split"] == "train"]
+    rounds = sorted(rd for rd in regen.glob("round*") if (rd / "results.jsonl").exists())
+    audits = {k: a for rd in rounds for k, a in load_audit(regen, rd).items()}
+    # a task's final outcome is its last round's result (a `continue` whose next round
+    # never ran stays `continue`)
+    outcomes = {r["sample_key"]: r for rd in rounds for r in load_jsonl(rd / "results.jsonl")}
+    finished = [t for rd in rounds for t in load_jsonl(rd / "sft_trajectories.regen.jsonl")]
+    excluded: dict[str, str] = {}
+    for key, res in outcomes.items():
+        if key in original_keys:
+            if res["action"] == "finish":
+                excluded[key] = "original_kept: the teacher trajectory is in the mix"
+            continue
+        if res["action"] == "finish":
+            a = audits[key]
+            if key in truncated:
+                excluded[key] = "truncated_history"
+            elif a["disqualified"]:
+                excluded[key] = (
+                    f"audit_disqualified: feedback {a['feedback']}, render {a['prompt_deviation']}"
+                )
+        elif res["action"] == "continue":
+            excluded[key] = f"no_clean_repair: continue, round {res['round'] + 1} not run"
+        else:
+            excluded[key] = f"no_clean_repair: {res['reason']}"
+    eligible = [t for t in finished if t["example_id"] not in excluded]
+    train_regen = [t for t in eligible if t["triton_rlm"]["split"] == "train"]
+    for t in eligible:
+        if t["triton_rlm"]["split"] != "train":
+            excluded[t["example_id"]] = "regenerated_val_split: val stays original-only"
     n_original_train = len(original.get("train", []))
     kept_keys = set(
         cap_regenerated(
             [t["example_id"] for t in train_regen], n_original_train, args.max_share, args.seed
         )
     )
-    kept_regen = [t for t in train_regen if t["example_id"] in kept_keys]
+    for t in train_regen:
+        if t["example_id"] not in kept_keys:
+            excluded[t["example_id"]] = f"resampled_out: over --max-share {args.max_share}"
+    kept_regen = [
+        tag_deviation(t, audits[t["example_id"]])
+        for t in train_regen
+        if t["example_id"] in kept_keys
+    ]
     mix = regen / "mix"
     summary: dict[str, Any] = {
         "original_trajectories_total": n_original_all,
         "original_repairs_excluded": n_original_all - len(original_keys),
+        "regenerated_tasks": len(outcomes),
         "regenerated_finished": len(finished),
-        "regenerated_not_train_split_excluded": len(finished) - len(train_regen),
         "regenerated_kept_after_cap": len(kept_regen),
+        "regenerated_kept_prompt_deviation": dict(
+            collections.Counter(
+                deviation_label(t["triton_rlm"]["prompt_deviation"]) for t in kept_regen
+            )
+        ),
+        "regenerated_kept_feedback_deviation": dict(
+            collections.Counter(
+                k for t in kept_regen for k in t["triton_rlm"]["feedback_deviation"]
+            )
+        ),
         "max_share": args.max_share,
+        "loss_masking": {
+            "sft_rows.<split>.jsonl": "USE THIS for SFT: one row per assistant turn with "
+            "the full history repeated, assistant_loss_only_last=true (only the final "
+            "assistant turn is supervised; same convention as the OOLONG per-turn rows)",
+            "sft_trajectories.<split>.jsonl": "trajectory-level eval/inspection only: one "
+            "row per trajectory, assistant_loss_only_last=false (every assistant turn "
+            "supervised under role-based masking); mixing it with OOLONG rows mixes two "
+            "masking conventions",
+        },
+        "excluded": dict(sorted(excluded.items())),
+        "excluded_by_reason": dict(
+            collections.Counter(reason.split(":")[0] for reason in excluded.values())
+        ),
         "per_split": {},
     }
     for split, trajs in original.items():
@@ -553,9 +739,8 @@ def collect(args: argparse.Namespace) -> None:
         ]
         regen_keys = {t["example_id"] for t in extra}
         rows += [
-            r
-            for rd in sorted(regen.glob("round*"))
-            if (rd / "sft_rows.regen.jsonl").exists()
+            tag_deviation(r, audits[r["example_id"]])
+            for rd in rounds
             for r in load_jsonl(rd / "sft_rows.regen.jsonl")
             if r["example_id"] in regen_keys
         ]
@@ -619,7 +804,19 @@ def main() -> None:
         action="store_true",
         help="keep only first-shot originals; teacher repairs enter the mix only if regenerated",
     )
+    c.add_argument(
+        "--truncated",
+        nargs="*",
+        default=[],
+        metavar="KEY",
+        help="sample_keys generated from a truncated history: tagged `truncated_history`, excluded",
+    )
     c.set_defaults(fn=collect)
+
+    a = sub.add_parser("audit")
+    a.add_argument("regen_dir")
+    a.add_argument("--round", type=int, required=True)
+    a.set_defaults(fn=audit)
 
     args = ap.parse_args()
     args.fn(args)

@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import random
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -159,3 +160,97 @@ def cap_regenerated(
     if len(regenerated_keys) <= limit:
         return sorted(regenerated_keys)
     return sorted(random.Random(seed).sample(sorted(regenerated_keys), limit))
+
+
+_REPL_VARS_LINE = re.compile(r"\n\nREPL variables: \[.*\]\n$")
+_REPL_VARS_ONLY = re.compile(r"^(REPL output[^\n]*:\n)REPL variables: \[.*\]\n$")
+_REPL_FILENAME = re.compile(r"<repl-[^>]*>")
+_FLOAT = re.compile(r"-?\d+\.\d+(?:e[+-]?\d+)?")
+
+Feedback = Literal["exact", "cosmetic", "stale", "unverifiable"]
+
+
+def without_repl_vars(message: str) -> str:
+    """A REPL output message as `_format_one` renders it without `locals_keys`: the
+    trailing `REPL variables: [...]` line removed, `No output` if nothing else was there."""
+    return _REPL_VARS_LINE.sub("", _REPL_VARS_ONLY.sub(r"\1No output", message))
+
+
+# Ways a replayed REPL output may legitimately differ from the one rendered for the
+# generator, in the order they are tried: the variables line (a log without
+# `locals_keys`), the worker's per-rollout `<repl-...>` filename inside tracebacks, and
+# float literals (a re-measured max_abs_diff / timing of the same kernel). Anything
+# else is a different error or message: `other`.
+NORMALISERS: dict[str, Callable[[str], str]] = {
+    "missing_repl_variables_line": without_repl_vars,
+    "repl_filename": lambda s: _REPL_FILENAME.sub("<repl>", s),
+    "float_values": lambda s: _FLOAT.sub("<f>", s),
+}
+
+
+def message_deviations(shown: str, rendered: str) -> list[str]:
+    """The normalisations needed to make the message the generator saw equal to the
+    replayed render (each listed only if the two differ without it); `["other"]` if no
+    combination suffices."""
+    if shown == rendered:
+        return []
+
+    def normalised(skip: str | None) -> tuple[str, str]:
+        a, b = shown, rendered
+        for name, fn in NORMALISERS.items():
+            if name != skip:
+                a, b = fn(a), fn(b)
+        return a, b
+
+    a, b = normalised(None)
+    if a != b:
+        return ["other"]
+    return [name for name in NORMALISERS if normalised(name)[0] != normalised(name)[1]]
+
+
+def prompt_deviation(
+    shown: list[dict[str, str]], rendered: list[dict[str, str]]
+) -> tuple[list[str], int | None]:
+    """How the transcript the generator was shown differs from the env render of the
+    same prefix: the union of `message_deviations` over the REPL output messages, with
+    the first differing message index; `["other"]` for any difference outside a REPL
+    output message."""
+    if len(shown) != len(rendered):
+        return ["other"], min(len(shown), len(rendered))
+    kinds: set[str] = set()
+    first: int | None = None
+    for i, (a, b) in enumerate(zip(shown, rendered, strict=True)):
+        if a == b:
+            continue
+        first = i if first is None else first
+        if a["role"] != b["role"] or not a["content"].startswith("REPL output"):
+            return ["other"], i
+        kinds.update(message_deviations(a["content"], b["content"]))
+        if "other" in kinds:
+            return ["other"], i
+    return sorted(kinds), first
+
+
+def feedback_status(
+    shown: list[dict[str, str]], rendered: list[dict[str, str]] | None
+) -> tuple[Feedback, list[str]]:
+    """Whether the last REPL output the generator answered is the one our worker
+    produced on replay for the same code: `exact` byte-for-byte (variables line aside),
+    `cosmetic` if they differ only by the replayed filename / re-measured floats (the
+    kinds are returned), `stale` if the error class or message differs, `unverifiable`
+    when the task has no replayed render (dropped before it could be emitted)."""
+    if rendered is None or len(rendered) < len(shown):
+        return "unverifiable", []
+    answered = shown[-2]["content"]
+    if not answered.startswith("REPL output"):
+        raise ValueError(f"message before the turn prompt is not a REPL output: {answered[:60]!r}")
+    kinds = [
+        k
+        for k in message_deviations(answered, rendered[len(shown) - 2]["content"])
+        if k != "missing_repl_variables_line"
+    ]
+    if not kinds:
+        return "exact", []
+    if kinds == ["other"]:
+        return "stale", kinds
+    return "cosmetic", kinds
