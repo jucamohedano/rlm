@@ -35,6 +35,7 @@ and review_flags.jsonl for tooling.
 from __future__ import annotations
 
 import argparse
+import ast
 import collections
 import difflib
 import hashlib
@@ -55,8 +56,10 @@ from triton_rlm.trace_translate import (
     SUBMIT_IDIOM,
     ParsedTrace,
     TurnClass,
+    changed_line_count,
     compatible,
     error_head_ratio,
+    extract_code,
     source_harness_markers,
 )
 
@@ -145,24 +148,37 @@ def our_feedback_text(history: list[dict[str, str]]) -> list[str]:
     ]
 
 
-_REPL_VARS_LINE = re.compile(r"^REPL variables: .*$", re.M)
+_REPL_VARS_LINE = re.compile(r"^REPL variables: (\[.*\])$", re.M)
 
 
-def same_messages(
-    emitted: list[dict[str, str]], rendered: list[dict[str, str]], executed: list[dict[str, Any]]
-) -> bool:
-    """Runs before `locals_keys` was logged cannot reproduce the `REPL variables:` line."""
-    if all("locals_keys" in log for log in executed):
-        return emitted == rendered
-
-    def strip(msgs: list[dict[str, str]]) -> list[tuple[str, str]]:
-        return [(m["role"], _REPL_VARS_LINE.sub("", m["content"])) for m in msgs]
-
-    return strip(emitted) == strip(rendered)
+def recover_locals_keys(
+    turn_logs: list[dict[str, Any]], emitted: list[dict[str, str]] | None
+) -> list[dict[str, Any]]:
+    """Runs before `locals_keys` was logged (67a4420) cannot re-render the
+    `REPL variables: [...]` line of `_format_one`; read it back from the emitted REPL
+    output message of the same turn so the render comparison stays exact. Everything
+    else in the message is still regenerated from the log."""
+    if emitted is None or all("locals_keys" in t for t in turn_logs if not t.get("skipped")):
+        return turn_logs
+    outputs = iter(our_feedback_text(emitted))
+    fixed: list[dict[str, Any]] = []
+    for t in turn_logs:
+        if t.get("skipped") or "locals_keys" in t:
+            fixed.append(t)
+            continue
+        m = _REPL_VARS_LINE.search(next(outputs, ""))
+        fixed.append({**t, "locals_keys": ast.literal_eval(m.group(1)) if m else []})
+    return fixed
 
 
 def tokens(text: str) -> set[str]:
     return {t for t in _IDENT.findall(text) if t.lower() not in _STOP}
+
+
+def unified_diff(before: str, after: str, a: str, b: str) -> str:
+    return "\n".join(
+        difflib.unified_diff(before.splitlines(), after.splitlines(), a, b, lineterm="", n=1)
+    )
 
 
 def added_lines(before: str, after: str) -> list[str]:
@@ -199,19 +215,24 @@ def turn_transition_flags(
     our_fb: str,
     next_reasoning: str,
     log: dict[str, Any],
+    their_code: str,
 ) -> list[str]:
+    """`their_code` is the turn's source before `convert_source` renamed the entry point:
+    their traceback names `triton_kernel_wrapper`, ours `triton_forward`, and the
+    teacher's reasoning naturally uses the name it wrote, which is not evidence of
+    conditioning on their feedback."""
     flags: list[str] = []
     if code == next_code:
         flags.append("IDENTICAL_CODE")
         return flags
-    theirs_only = tokens(their_fb) - tokens(our_fb) - tokens(code)
+    theirs_only = tokens(their_fb) - tokens(our_fb) - tokens(code) - tokens(their_code)
     added = "\n".join(added_lines(code, next_code))
     used = sorted(theirs_only & tokens(added))
     if used:
         flags.append(f"THEIR_ONLY_TOKENS:{','.join(used)}")
     cited = sorted(theirs_only & tokens(next_reasoning))
     if cited:
-        flags.append(f"REASONING_CITES_THEIRS:{','.join(cited[:6])}")
+        flags.append(f"REASONING_CITES_THEIRS:{','.join(cited)}")
     bad_lines = our_error_lines(code, our_fb, log)
     if bad_lines:
         src, nxt = code.splitlines(), set(next_code.splitlines())
@@ -231,6 +252,7 @@ def review_trace(
     max_iterations: int,
 ) -> tuple[dict[str, Any], str]:
     keep_end = summary["kept_prefix_len"] - 1 if summary["kept"] else None
+    turn_logs = recover_locals_keys(turn_logs, emitted)
     history = render(trace, turn_logs, keep_end, max_iterations)
     our_fb = our_feedback_text(history)
     executed = [t for t in turn_logs if not t.get("skipped")]
@@ -243,8 +265,12 @@ def review_trace(
     ]
     if leaks:
         flags.append("LEAK:" + ";".join(leaks[:4]))
-    if emitted is not None and not same_messages(emitted, history, executed):
-        flags.append("RENDER_MISMATCH")
+    if emitted is not None and emitted != history:
+        first = next(
+            (i for i, (a, b) in enumerate(zip(emitted, history, strict=False)) if a != b),
+            min(len(emitted), len(history)),
+        )
+        flags.append(f"RENDER_MISMATCH:msg{first}")
 
     per_turn: list[dict[str, Any]] = []
     for i, log in enumerate(executed):
@@ -274,6 +300,10 @@ def review_trace(
         if i + 1 < len(executed):
             code, next_code = trace.turns[k].code, trace.turns[executed[i + 1]["index"]].code
             assert code is not None and next_code is not None
+            row["changed_lines"] = changed_line_count(code, next_code)
+            row["diff"] = unified_diff(code, next_code, f"t{k}", f"t{executed[i + 1]['index']}")
+            row["their_error"] = _cell(_first_error_line(raw_turns[k].get("feedback_given") or ""))
+            row["our_error"] = _cell(_our_error_head(log))
             row["flags"] += turn_transition_flags(
                 code,
                 next_code,
@@ -281,6 +311,7 @@ def review_trace(
                 our_fb[i],
                 raw_turns[executed[i + 1]["index"]].get("reasoning") or "",
                 log,
+                extract_code(raw_turns[k].get("full_completion")) or "",
             )
         per_turn.append(row)
         flags += [f"t{k}:{f}" for f in row["flags"]]
@@ -288,6 +319,8 @@ def review_trace(
     record = {
         "sample_key": trace.sample_key,
         "kept": summary["kept"],
+        "kept_prefix_len": summary["kept_prefix_len"],
+        "first_correct_turn": summary["first_correct_turn"],
         "repair": summary["repair"],
         "drop_reason": summary["drop_reason"],
         "recorded_classes": summary["recorded_classes"],
@@ -355,6 +388,13 @@ def render_markdown(
         out.append("~~~text")
         out.append(str(our_err).replace("~~~", "~ ~ ~") or "<none>")
         out.append("~~~")
+        if "diff" in row:
+            out.append(
+                f"source diff to the next executed turn ({row['changed_lines']} changed lines):"
+            )
+            out.append("```diff")
+            out.append(row["diff"].replace("```", "` ` `"))
+            out.append("```")
         nxt = k + 1
         if nxt < len(raw_turns) and raw_turns[nxt].get("reasoning"):
             out.append(f"their recorded reasoning for turn {nxt} (NOT emitted):")
@@ -376,6 +416,58 @@ def render_markdown(
 
 def _cell(text: str) -> str:
     return " ".join(text.split()).replace("|", "\\|")[:120] or "-"
+
+
+def _first_error_line(feedback: str) -> str:
+    for line in feedback.splitlines():
+        if re.match(r"^\w+(Error|Exception|Construct)\b", line.strip()):
+            return line.strip()
+    return feedback.splitlines()[0] if feedback else ""
+
+
+def _our_error_head(log: dict[str, Any]) -> str:
+    verify = log.get("verify") or {}
+    if log.get("exception"):
+        return _first_error_line(str(log["exception"])) or str(log["exception"])
+    if verify.get("error"):
+        chain = verify.get("error_chain") or []
+        inner = f" <- {chain[-1]}" if chain else ""
+        return f"{verify['error']}{inner}"
+    if verify.get("correct"):
+        return f"correct, speedup {verify.get('speedup')}"
+    if verify.get("compiled"):
+        return f"incorrect, max_abs_diff {verify.get('max_diff')}"
+    return ""
+
+
+_FAILED = ("error", "incorrect")
+
+
+def flag_names(flags: list[str]) -> set[str]:
+    return {re.sub(r"^t\d+:", "", fl).split(":")[0] for fl in flags}
+
+
+def repair_transitions(record: dict[str, Any]) -> list[dict[str, Any]]:
+    """The failed turns before the first correct one: the transitions that make a kept
+    trace a repair, and the only place a stitched edit could enter the emitted data."""
+    first_correct = record["first_correct_turn"]
+    return [
+        row
+        for row in record["per_turn"]
+        if row["turn"] < first_correct and row["ours"].startswith(_FAILED)
+    ]
+
+
+def divergence_site(record: dict[str, Any], row: dict[str, Any]) -> str:
+    """Where a DIVERGENT_INCOMPATIBLE turn sits relative to what we emit. `decide` drops
+    an incompatible *failed* turn inside the kept prefix, so `kept_failed` must be 0;
+    `kept_correct` is our verified result overriding their recorded class (kept on
+    purpose: the kernel is correct under our verifier whatever their harness said)."""
+    if not record["kept"]:
+        return "dropped_trace"
+    if row["turn"] >= record["kept_prefix_len"]:
+        return "beyond_kept_prefix"
+    return "kept_failed" if row["ours"].startswith(_FAILED) else "kept_correct"
 
 
 def select(summaries: list[dict[str, Any]], review_all: bool) -> dict[str, list[str]]:
@@ -411,6 +503,7 @@ def main() -> None:
     )
     ap.add_argument("--max-iterations", type=int, default=8)
     ap.add_argument("--min-head-ratio", type=float, default=0.6)
+    ap.add_argument("--small-diff-max", type=int, default=4)
     args = ap.parse_args()
 
     reexec = Path(args.reexec_dir)
@@ -466,14 +559,75 @@ def main() -> None:
     flag_counts = collections.Counter(
         re.sub(r"^t\d+:", "", fl).split(":")[0] for r in records for fl in r["flags"]
     )
+    trace_counts = collections.Counter(fl for r in records for fl in flag_names(r["flags"]))
     idx = [f"# ppbhatt review: {len(records)} traces of {len(summaries)}", ""]
     idx.append("## Selection")
     for g, keys in sorted(groups.items()):
         idx.append(f"- {g}: {len(keys)}")
-    idx += ["", "## Flag totals (heuristic, over reviewed traces)"]
+    idx += ["", "## Flag totals (heuristic; turns flagged / traces with the flag)"]
     for fl, n in flag_counts.most_common():
-        idx.append(f"- {fl}: {n}")
+        idx.append(f"- {fl}: {n} / {trace_counts[fl]}")
     idx += ["", f"## System prompt digests across rendered traces: {dict(system_digests)}", ""]
+
+    cited = collections.Counter(
+        tok
+        for r in records
+        for row in r["per_turn"]
+        for fl in row["flags"]
+        if fl.startswith("REASONING_CITES_THEIRS:")
+        for tok in fl.split(":", 1)[1].split(",")
+    )
+    idx += [
+        "## REASONING_CITES_THEIRS: which of their-only tokens the teacher's reasoning cites",
+        "",
+        "Harness-frame vocabulary (paths, wrapper names, benchmark helpers) means the teacher",
+        "quoted their traceback frame; identifiers from the *error content* that our feedback",
+        "lacks are the real conditioning tell.",
+        "",
+    ]
+    idx += [f"- `{tok}`: {n}" for tok, n in cited.most_common(40)]
+    idx.append("")
+
+    sites = collections.Counter(
+        divergence_site(r, row)
+        for r in records
+        for row in r["per_turn"]
+        if "DIVERGENT_INCOMPATIBLE" in row["flags"]
+    )
+    idx += [
+        "## DIVERGENT_INCOMPATIBLE turns by position (kept_failed must be 0)",
+        "",
+        *[f"- {site}: {n}" for site, n in sorted(sites.items())],
+        "",
+    ]
+
+    repairs = [r for r in records if r["repair"]]
+    repair_flag_traces = collections.Counter(
+        fl
+        for r in repairs
+        for fl in {f for row in repair_transitions(r) for f in flag_names(row["flags"])}
+    )
+    clean = [r for r in repairs if not any(row["flags"] for row in repair_transitions(r))]
+    idx += [
+        f"## Repair transitions ({len(repairs)} repairs): flags on the failed->correct edits",
+        "",
+        f"- repairs with no flag on any repairing transition: {len(clean)}",
+        *[
+            f"- repairs with {fl} on a repairing transition: {n}"
+            for fl, n in sorted(repair_flag_traces.items())
+        ],
+        "",
+        "| trace | failed turn | ours | recorded | changed lines | flags |",
+        "|---|---|---|---|---|---|",
+    ]
+    for r in repairs:
+        for row in repair_transitions(r):
+            idx.append(
+                f"| [{r['sample_key']}]({r['sample_key']}.md) | {row['turn']} | {row['ours']} | "
+                f"{row['recorded']} | {row.get('changed_lines', '-')} | "
+                f"{'; '.join(row['flags']) or '-'} |"
+            )
+    idx.append("")
     mismatches = [
         (r, row)
         for r in records
@@ -495,6 +649,34 @@ def main() -> None:
                 f"`{_cell(' // '.join(row['our_chain']))}` |"
             )
         idx.append("")
+    small = [
+        (r, row)
+        for r in records
+        for row in r["per_turn"]
+        if "changed_lines" in row and row["changed_lines"] <= args.small_diff_max
+    ]
+    if small:
+        idx += [
+            f"## Small transitions (<= {args.small_diff_max} changed source lines): "
+            "is the edit a fix for OUR error?",
+            "",
+            "Kept-trace transitions are in the emitted data; dropped ones are shown for the record.",
+            "",
+        ]
+        for r, row in small:
+            idx += [
+                f"### {r['sample_key']} t{row['turn']} ({row['changed_lines']} lines; "
+                f"kept={r['kept']}, repair={r['repair']})",
+                "",
+                f"- THEIR error after t{row['turn']}: `{row['their_error']}`",
+                f"- OUR error after t{row['turn']}: `{row['our_error']}`",
+                f"- flags: {row['flags'] or 'none'}",
+                "",
+                "```diff",
+                row["diff"].replace("```", "` ` `"),
+                "```",
+                "",
+            ]
     idx += [
         "## Traces",
         "",

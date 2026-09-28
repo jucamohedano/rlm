@@ -76,6 +76,32 @@ def source_harness_markers(text: str) -> list[str]:
     return [m for m in SOURCE_HARNESS_MARKERS if m in text]
 
 
+def changed_line_count(before: str, after: str) -> int:
+    """Number of added + removed lines between two sources (0 iff byte-identical modulo
+    trailing whitespace on the last line)."""
+    return sum(
+        1
+        for line in difflib.unified_diff(before.splitlines(), after.splitlines(), lineterm="", n=0)
+        if line[:1] in "+-" and not line.startswith(("+++", "---"))
+    )
+
+
+def repair_diff_lines(
+    codes: list[str | None], ours: list[TurnClass], first_correct: int
+) -> list[int]:
+    """For every executed turn before the first correct one: the number of source lines
+    that differ between it and the first correct turn, or 0 if that turn did not fail.
+    `repair` is `any(n > 0)`: a repair is a failed turn followed by a *different* kernel
+    that we verified correct, never the same source re-run."""
+    correct_code = codes[first_correct]
+    if correct_code is None:
+        raise ValueError(f"first correct turn {first_correct} has no code")
+    return [
+        changed_line_count(codes[i] or "", correct_code) if c.kind in ("error", "incorrect") else 0
+        for i, c in enumerate(ours[:first_correct])
+    ]
+
+
 _TRITON_BLOCK = re.compile(r"<triton>\s*\n?(.*?)\n?\s*</triton>", re.S)
 _EXC_HEAD = re.compile(r"^([A-Za-z_][\w.]*(?:Error|Exception|Exit|Interrupt|Warning)?)\s*:\s*(.*)$")
 

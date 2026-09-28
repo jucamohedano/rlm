@@ -57,6 +57,7 @@ from triton_rlm.trace_translate import (
     TurnClass,
     classify_ours,
     decide,
+    repair_diff_lines,
     source_harness_markers,
 )
 
@@ -176,6 +177,7 @@ async def reexec_trace(
         "reward": None,
         "first_correct_turn": None,
         "repair": False,
+        "repair_diff_lines": [],
     }
     if decision.action != "keep":
         return out
@@ -202,12 +204,8 @@ async def reexec_trace(
     out["reward"] = milestone_reward(turn_logs[keep_end]["verify"])
     first_correct = next(i for i, c in enumerate(ours) if c.kind.startswith("correct"))
     out["first_correct_turn"] = first_correct
-    # A repair is a failed turn followed by a different kernel that we verified correct
-    # (not the same source re-run, which their harness could produce and ours cannot).
-    out["repair"] = any(
-        c.kind in ("error", "incorrect") and trace.turns[i].code != trace.turns[first_correct].code
-        for i, c in enumerate(ours[:first_correct])
-    )
+    out["repair_diff_lines"] = repair_diff_lines([t.code for t in trace.turns], ours, first_correct)
+    out["repair"] = any(n > 0 for n in out["repair_diff_lines"])
     return out
 
 
@@ -229,6 +227,7 @@ def trace_summary(trace: ParsedTrace, res: dict[str, Any]) -> dict[str, Any]:
         "kept_prefix_len": keep_end + 1 if kept else 0,
         "first_correct_turn": res["first_correct_turn"],
         "repair": res["repair"],
+        "repair_diff_lines": res["repair_diff_lines"],
         "final_class": ours[keep_end] if kept else (ours[-1] if ours else None),
         "truncated_at": None if kept else len(ours) - 1,
         "drop_reason": None if kept else d["reason"],
@@ -273,6 +272,7 @@ def sft_rows(res: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, Any]]
         "decision": res["decision"]["reason"],
         "first_correct_turn": res["first_correct_turn"],
         "repair": res["repair"],
+        "repair_diff_lines": res["repair_diff_lines"],
         "final_verify": {
             k: res["turn_logs"][res["decision"]["keep_end"]]["verify"].get(k)
             for k in ("compiled", "correct", "speedup", "max_diff")

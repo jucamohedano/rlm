@@ -24,6 +24,7 @@ def result(key: str, ours: list[str], decision: dict, **extra) -> dict:
         "reward": extra.pop("reward", None),
         "first_correct_turn": extra.pop("first_correct_turn", None),
         "repair": extra.pop("repair", False),
+        "repair_diff_lines": extra.pop("repair_diff_lines", []),
     }
     assert not extra
     return base
@@ -36,11 +37,13 @@ def test_kept_repair_rollup() -> None:
         {"action": "keep", "keep_end": 1, "reason": "correct_fast at turn 1"},
         first_correct_turn=1,
         repair=True,
+        repair_diff_lines=[3],
         reward=1.0,
     )
     s = reexec.trace_summary(trace("a", "b", "c"), res)
     assert s["kept"] and s["kept_prefix_len"] == 2
     assert s["first_correct_turn"] == 1 and s["repair"] is True
+    assert s["repair_diff_lines"] == [3]
     assert s["final_class"] == "correct_fast"
     assert s["truncated_at"] is None and s["drop_reason"] is None
     assert s["n_source_turns"] == 3 and s["n_executed_turns"] == 3

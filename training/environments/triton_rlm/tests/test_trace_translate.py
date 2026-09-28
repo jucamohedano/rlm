@@ -2,6 +2,7 @@ import pytest
 from triton_rlm.trace_translate import (
     AmbiguousReference,
     TurnClass,
+    changed_line_count,
     classify_ours,
     classify_recorded,
     compatible,
@@ -11,6 +12,7 @@ from triton_rlm.trace_translate import (
     extract_code,
     normalize_pytorch,
     reference_root_class,
+    repair_diff_lines,
 )
 
 ERR = TurnClass("error", "CompilationError", "at 12:4: def kernel(x_ptr, ...)")
@@ -171,6 +173,27 @@ def test_decide_correct_slow_prefix_and_faster_tail() -> None:
     assert decide([INC, FAST], [SLOW], 0.6).keep_end == 0
     # slow on the last turn -> keep
     assert decide([SLOW], [SLOW], 0.6).keep_end == 0
+
+
+def test_changed_line_count() -> None:
+    a = "x = 1\ny = 2\nz = 3"
+    assert changed_line_count(a, a) == 0
+    assert changed_line_count(a, "x = 1\ny = 20\nz = 3") == 2
+    assert changed_line_count(a, "x = 1\ny = 2\nz = 3\nw = 4") == 1
+
+
+def test_repair_requires_source_diff_from_the_failed_turn() -> None:
+    launch = "k[grid, 4](x)"
+    fixed = "k[grid](x, num_warps=4)"
+    # error -> different code -> correct: a repair, and the artifact says by how much.
+    assert repair_diff_lines([launch, fixed], [ERR, FAST], 1) == [2]
+    # error -> same code re-run -> correct: NOT a repair (flaky pass), diff is 0.
+    assert repair_diff_lines([launch, launch], [ERR, FAST], 1) == [0]
+    # correct_slow before first_correct never happens, but a non-failing prefix counts 0.
+    assert repair_diff_lines([launch, launch, fixed], [ERR, INC, FAST], 2) == [2, 2]
+    assert repair_diff_lines([fixed], [FAST], 0) == []
+    with pytest.raises(ValueError):
+        repair_diff_lines([launch, None], [ERR, FAST], 1)
 
 
 def test_root_class_skips_building_blocks_and_rejects_ambiguity() -> None:
