@@ -6,6 +6,8 @@ Writes to out_dir:
     traces.jsonl    one ParsedTrace per line (converted code per turn + their recorded class)
     manifest.jsonl  one task per line: {"_task_id","_n_ops","ops","data_source","code","split","cluster"}
     parse_report.txt  the dry-run: per trace, turns found and their recorded classes
+    parse_args.json   {"source","holdout_frac","seed","minhash_threshold"}: the flags that fixed
+                      the cluster -> split assignment; a consumer re-parsing must pass the same ones
 
 Dedupe is by MinHash over normalised `pytorch_code` and happens BEFORE the split;
 the split is assigned per cluster so near-duplicate tasks never straddle it.
@@ -51,8 +53,15 @@ def main() -> None:
         for r, c in zip(rows, clusters, strict=True)
     ]
 
+    parse_args = {
+        "source": args.source,
+        "holdout_frac": args.holdout_frac,
+        "seed": args.seed,
+        "minhash_threshold": args.minhash_threshold,
+    }
     out = Path(args.out_dir)
     out.mkdir(parents=True, exist_ok=True)
+    (out / "parse_args.json").write_text(json.dumps(parse_args, indent=2) + "\n", encoding="utf-8")
     with (out / "traces.jsonl").open("w", encoding="utf-8") as f:
         for t in traces:
             f.write(json.dumps(t.to_json()) + "\n")
@@ -90,6 +99,7 @@ def main() -> None:
         )
     dup_clusters = [c for c, n in collections.Counter(clusters).items() if n > 1]
     summary = [
+        f"args: {json.dumps(parse_args)}",
         f"rows kept (source={args.source}): {len(traces)}",
         f"turns: {n_turns}  (per-trace histogram {dict(sorted(turn_hist.items()))})",
         f"turns without a <triton> block: {n_no_code}",
